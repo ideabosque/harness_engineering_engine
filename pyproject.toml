@@ -1,0 +1,113 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "harness-engineering-engine"
+version = "0.0.1"
+description = "Harness Engineering Engine — skill catalog, deployment, and retrieval for agentic skills"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Idea Bosque", email = "ideabosque@gmail.com"}
+]
+classifiers = [
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "graphene",
+    "pendulum",
+    "tenacity",
+    "pyyaml",
+    "SilvaEngine-DynamoDB-Base",
+    "SilvaEngine-Utility",
+    "silvaengine-constants",
+]
+
+[project.optional-dependencies]
+postgresql = [
+    "SQLAlchemy>=1.4",
+    "psycopg2-binary>=2.9",
+    "alembic>=1.10",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=23.0",
+    "flake8>=6.0",
+    "mypy>=1.0",
+]
+test = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "python-dotenv>=1.0",
+    "SQLAlchemy>=1.4",
+    "psycopg2-binary>=2.9",
+    "alembic>=1.10",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["harness_engineering_engine*"]
+exclude = ["tests*", "*.tests*"]
+
+[tool.setuptools.package-data]
+harness_engineering_engine = ["py.typed"]
+[tool.black]
+line-length = 88
+target-version = ["py38", "py39", "py310", "py311"]
+include = '\.pyi?$'
+
+[tool.pytest.ini_options]
+testpaths = ["harness_engineering_engine/tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "-v --strict-markers --tb=short --color=yes"
+markers = [
+    "unit: Unit tests that don't require external dependencies",
+    "integration: Integration tests that require external services (DB, API, etc.)",
+    "slow: Tests that take significant time to run",
+    "skip: Tests that are temporarily disabled",
+]
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+log_cli_date_format = "%Y-%m-%d %H:%M:%S"
+filterwarnings = [
+    "error",
+    "ignore::UserWarning",
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+minversion = "7.0"
+console_output_style = "progress"
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+
+[tool.pyright]
+typeCheckingMode = "basic"
+reportCallIssue = "none"
+reportArgumentType = "none"
+reportArgumentTypeIssues = "none"
+reportRedeclaration = "none"
+reportOptionalMemberAccess = "none"
+reportAttributeAccessIssue = "none"
+reportSelfClsParameterName = "none"
+reportGeneralTypeIssues = "none"
