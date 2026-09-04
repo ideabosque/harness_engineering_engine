@@ -40,7 +40,7 @@ class TestConfig:
         cfg = self._init_config()
         assert cfg.RUN_COMMAND_ENABLED is False
         assert cfg.DRY_RUN is False
-        assert cfg.SKILL_ARTIFACT_PREFIX == "skills/"
+        assert cfg.GIT_SSH_KEY_PATH == ""
         assert cfg.RUN_COMMAND_DEFAULT_TIMEOUT_SECONDS == 30
         assert cfg.RUN_COMMAND_OUTPUT_LIMIT_BYTES == 20_000
         assert cfg.SKILL_LOCAL_METADATA_FILE == ".hsk-skill.json"

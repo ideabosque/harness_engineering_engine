@@ -48,16 +48,14 @@ class SkillModel(Base):
     description = Column(Text)
 
     # Deployment source
-    source_type = Column(String(16))
-    source_ref = Column(Text)
+    source_type = Column(String(16))  # always "git"
+    source_ref = Column(Text)  # git remote URL
 
-    # S3 artifact location
-    s3_bucket = Column(String(255))
-    s3_key = Column(Text)
-    s3_version_id = Column(String(255))
+    # Git pin — the ref requested at deploy time and the commit it resolved to.
+    git_ref = Column(String(255))
+    resolved_commit = Column(String(64))
 
     # Integrity
-    artifact_checksum = Column(String(64))
     content_checksum = Column(String(64))
 
     # Runtime cache

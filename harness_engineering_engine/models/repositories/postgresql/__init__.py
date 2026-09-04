@@ -12,9 +12,11 @@ from ..base import EntityRepository
 def register_all(registry: Dict[str, EntityRepository]) -> None:
     """Register all PostgreSQL repositories into the given registry dict."""
     from .skill_repo import SkillPGRepository
+    from .cli_package_repo import CliPackagePGRepository
 
     repos = [
         SkillPGRepository(),
+        CliPackagePGRepository(),
     ]
     for repo in repos:
         registry[repo.entity_type] = repo

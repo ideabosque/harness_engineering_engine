@@ -12,10 +12,13 @@ def initialize_tables(logger: logging.Logger, db_session) -> None:
     logger.info("Initializing PostgreSQL tables...")
     from ...utils.rls import create_rls_policies
     from .skill import SkillModel
+    from .cli_package import CliPackageModel
 
     engine = db_session.bind
     SkillModel.__table__.create(engine, checkfirst=True)
     logger.info("PostgreSQL table 'hsk_skills' created (if not present).")
+    CliPackageModel.__table__.create(engine, checkfirst=True)
+    logger.info("PostgreSQL table 'hsk_cli_packages' created (if not present).")
 
     create_rls_policies(engine)
     logger.info("RLS policies applied.")

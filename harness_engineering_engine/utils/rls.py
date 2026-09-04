@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 # All harness-engineering PostgreSQL tables carry a ``partition_key`` column.
 _RLS_TABLES = [
     "skills",
+    "cli_packages",
 ]
 
 

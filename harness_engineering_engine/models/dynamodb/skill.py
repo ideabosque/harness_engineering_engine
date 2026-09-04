@@ -66,16 +66,14 @@ class SkillModel(BaseModel):
     description = UnicodeAttribute(null=True)
 
     # Deployment source
-    source_type = UnicodeAttribute(null=True)  # github | zip
-    source_ref = UnicodeAttribute(null=True)
+    source_type = UnicodeAttribute(null=True)  # always "git"
+    source_ref = UnicodeAttribute(null=True)  # git remote URL
 
-    # S3 artifact location
-    s3_bucket = UnicodeAttribute(null=True)
-    s3_key = UnicodeAttribute(null=True)
-    s3_version_id = UnicodeAttribute(null=True)
+    # Git pin — the ref requested at deploy time and the commit it resolved to.
+    git_ref = UnicodeAttribute(null=True)
+    resolved_commit = UnicodeAttribute(null=True)
 
     # Integrity
-    artifact_checksum = UnicodeAttribute(null=True)
     content_checksum = UnicodeAttribute(null=True)
 
     # Runtime cache
@@ -266,10 +264,8 @@ def insert_update_skill(info: ResolveInfo, **kwargs: Dict[str, Any]) -> None:
             "description",
             "source_type",
             "source_ref",
-            "s3_bucket",
-            "s3_key",
-            "s3_version_id",
-            "artifact_checksum",
+            "git_ref",
+            "resolved_commit",
             "content_checksum",
             "local_path",
             "deployment_status",
@@ -298,10 +294,8 @@ def insert_update_skill(info: ResolveInfo, **kwargs: Dict[str, Any]) -> None:
         "description": SkillModel.description,
         "source_type": SkillModel.source_type,
         "source_ref": SkillModel.source_ref,
-        "s3_bucket": SkillModel.s3_bucket,
-        "s3_key": SkillModel.s3_key,
-        "s3_version_id": SkillModel.s3_version_id,
-        "artifact_checksum": SkillModel.artifact_checksum,
+        "git_ref": SkillModel.git_ref,
+        "resolved_commit": SkillModel.resolved_commit,
         "content_checksum": SkillModel.content_checksum,
         "local_path": SkillModel.local_path,
         "deployment_status": SkillModel.deployment_status,

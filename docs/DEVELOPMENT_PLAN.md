@@ -1,27 +1,30 @@
 # Harness Engineering - Development Plan
 
 > **Location:** `C:\Users\bibo7\gitrepo\silvaengine\harness_engineering_engine`
-> **Date:** 2026-08-25
-> **Status:** P1-P5 built and wired end to end; P6 partial; CLI package manager stubbed (v1.1)
+> **Date:** 2026-09-04
+> **Status:** P1-P5 built and wired end to end; P6 partial; CLI package manager stubbed (v1.1); skill deployment now sources directly from git — no S3 or other artifact store
 
 ### Implementation status
 
 | Phase | Scope | State |
 |---|---|---|
 | P1 | Index model, `insertUpdateSkill`, `searchSkills`, `skill(name)` | Done - `skill(name)` now dispatches to on-demand refresh, see Known issue #1 (fixed) |
-| P2 | `deploySkillPackage`, S3 artifact upload, checksums | Done - first version of a skill auto-activates, see Known issue #2 (fixed) |
+| P2 | `deploySkillPackage`, git intake, local install, checksums | Done - first version of a skill auto-activates, see Known issue #2 (fixed); S3 eliminated (Known issue #3), ZIP source removed (Known issue #5) |
 | P3 | `refreshLocalSkills`, `registerSkills`, rollback/promote/disable/prune | Done |
 | P4 | `mcp_skill_provider` module (`search_skills`, `get_skill`), built at `../mcp_skill_provider`, registered with `mcp_daemon_engine` | Done |
 | P5 | `run_command` / guarded command executor | Done |
 | P6 | Starter skills (`rfq-assistant`, `release-notes`) and templates | Partial - authoring/operator guides not yet written |
 | v1.1 | Python CLI package manager (§11) | Stubbed - `CliPackageManager.ensure_package()` raises `NotImplementedError` by design; skills must use local scripts until this ships |
 
-Test coverage today: `checksums`, `command_executor` (kill switch, allowlist match/reject, shell-metacharacter rejection, dry run), `config`, `skill_frontmatter`, `queries.skill::resolve_skill` (name dispatch, not-found handling, uuid fallback), and `skill_deployment` (first-version auto-activation). Not yet covered: full deployment happy path against a real GitHub source, refresh, registration, GraphQL mutations end to end, auth/tenant boundaries, MCP integration, and command-executor timeout/output-cap/path-traversal behavior (see §15).
+Test coverage today (55 tests): `checksums`, `command_executor` (kill switch, allowlist match/reject, shell-metacharacter rejection, dry run), `config`, `skill_frontmatter`, `queries.skill::resolve_skill` (name dispatch, not-found handling, uuid fallback), `skill_deployment` (first-version auto-activation, promote-gating, redeploy-skip against real local git repos), CLI package manager (registration, install, upgrade, verify, failure handling), integration scenarios against local Postgres (registration, git deploy, on-demand git refresh, promote/rollback, command policy), and resilience/reconciliation (missing data, invalid data, disabled skills, cross-tenant RLS, kill-switch, resolved-commit integrity, single-active-version, content checksum). Not yet covered: auth/tenant boundaries beyond RLS, full MCP integration, and command-executor timeout/output-cap/path-traversal behavior (see §15).
 
 ### Known issues (found by tracing the code against this plan, now fixed)
 
-1. **Fixed.** `skill(name)` did not return the skill body and never triggered on-demand S3 refresh. `handlers/skill_reader.py` already implemented exactly the logic this plan specifies (§7 "On-demand refresh", §9's return shape, the second mermaid sequence), but nothing in the GraphQL layer called it: `queries/skill.py::resolve_skill` called `get_repo("skill").resolve_single(info, **kwargs)`, a plain DB row fetch, and `types/skill.py::SkillType` had no `body`, `allowed_commands`, `cli_packages`, `local_content_checksum`, or `stale_index` field to carry that data even if it had. A second, independent bug compounded this: the `skill`/`skills` GraphQL fields declared their `name`/`description` arguments as `skill_name=String(name="name", ...)`, which in graphene sets the *GraphQL-facing* argument name but leaves the resolver's Python kwarg as `skill_name` — so `resolve_single`'s `kwargs.get("name")` and `list()`'s `filters.get("name")`/`filters.get("description")` never actually received a value, silently no-oping the name/description filters regardless of the wiring fix. **Applied:** `SkillType` now carries `body`, `allowed_commands`, `cli_packages`, `local_content_checksum`, `stale_index`; `resolve_skill` dispatches `name` lookups to `handlers.skill_reader.skill()` (returning `None` on `ValueError`/`FileNotFoundError`, propagating anything else) and falls back to the repo for `skill_uuid` lookups; `schema.py`'s `skill`/`skills` fields now declare `name`/`description` directly instead of aliasing through `skill_name`/`skill_description`. Covered by `tests/test_queries_skill.py`.
+1. **Fixed.** `skill(name)` did not return the skill body and never triggered on-demand refresh (S3-backed at the time this was found; the refresh source has since moved to git — see Known issue #3). `handlers/skill_reader.py` already implemented exactly the logic this plan specifies (§7 "On-demand refresh", §9's return shape, the second mermaid sequence), but nothing in the GraphQL layer called it: `queries/skill.py::resolve_skill` called `get_repo("skill").resolve_single(info, **kwargs)`, a plain DB row fetch, and `types/skill.py::SkillType` had no `body`, `allowed_commands`, `cli_packages`, `local_content_checksum`, or `stale_index` field to carry that data even if it had. A second, independent bug compounded this: the `skill`/`skills` GraphQL fields declared their `name`/`description` arguments as `skill_name=String(name="name", ...)`, which in graphene sets the *GraphQL-facing* argument name but leaves the resolver's Python kwarg as `skill_name` — so `resolve_single`'s `kwargs.get("name")` and `list()`'s `filters.get("name")`/`filters.get("description")` never actually received a value, silently no-oping the name/description filters regardless of the wiring fix. **Applied:** `SkillType` now carries `body`, `allowed_commands`, `cli_packages`, `local_content_checksum`, `stale_index`; `resolve_skill` dispatches `name` lookups to `handlers.skill_reader.skill()` (returning `None` on `ValueError`/`FileNotFoundError`, propagating anything else) and falls back to the repo for `skill_uuid` lookups; `schema.py`'s `skill`/`skills` fields now declare `name`/`description` directly instead of aliasing through `skill_name`/`skill_description`. Covered by `tests/test_queries_skill.py`.
 2. **Fixed.** A freshly deployed skill had no active version. `handlers/skill_deployment.py::deploy_skill_package` always inserted with `is_active=False` and `deployment_status="uploaded"`, while every agent-facing read path (`skill_reader._get_active_skill`, `refresh_local_skills`, `run_command`) filters on `is_active=True` - so `deploySkillPackage` alone never made a skill retrievable, even for a brand-new skill with no prior version to roll back from. **Applied:** `deploy_skill_package` now checks for an existing active version of the same skill name before registering; if none exists, the new version is inserted with `is_active=True` and `deployment_status="deployed"`, otherwise it lands inactive as before and still requires an explicit `promoteSkillVersion`. Covered by `tests/test_skill_deployment.py`.
+3. **Fixed (architecture change, not a bug).** S3 has been eliminated entirely from skill deployment and retrieval. Skills were, as of this fix, sourced from a git remote (`source_type="git"`) or a local ZIP with no durable remote (`source_type="zip"`); there is no artifact store in between. (ZIP support was subsequently removed too — see Known issue #5.) This invalidates every S3-specific passage written before 2026-09-04 — the rest of this document has been updated to match. `handlers/git_client.py` handles clone/`ls-remote`/SSH-identity concerns; the "is there a new version" check consults git alone (a cheap `git ls-remote`, no clone) via `deploy_skill_package`; `handlers/skill_version_cache.py` provides the local per-version content cache that lets `promoteSkillVersion`/`rollbackSkill` swap versions instantly with no remote fetch. See §2, §6, §7, §9 for current behavior.
+4. **Fixed.** `handlers/checksums.py::compute_content_checksum` wrapped `os.walk()` in `sorted()`, which eagerly consumes the whole tree *before* the hidden-directory prune (`dirs[:] = ...`) ever runs — so `.git` directories were silently included in the checksum despite the code's intent to exclude them. This was invisible under the old ZIP-based flow (an extracted ZIP never contains `.git`), but broke the new git-refresh path outright: two different clone methods produce differently-shaped `.git` internals for the identical commit, so the checksum diverged and refresh failed with a false mismatch error. Found via a live smoke test against a real GitHub repo. **Applied:** removed the `sorted()` wrapper — the existing in-place `dirs[:] = sorted(...)` and `sorted(files)` at each level already give deterministic ordering without needing to consume the whole walk upfront. Covered by `tests/test_checksums.py::test_excludes_hidden_directories`.
+5. **Fixed (architecture change, not a bug).** ZIP-sourced deployment has been removed entirely. `deploySkillPackage` now only accepts a git remote — the `sourceType` GraphQL argument and the `source_type` parameter on `deploy_skill_package()` are gone, since there is only one supported value. The local per-version cache (`handlers/skill_version_cache.py`) is retained: it still makes `promoteSkillVersion`/`rollbackSkill` instant (no remote fetch on every promotion), and every host that never cached a given version falls back to fetching it straight from git, pinned to the registered commit. `source_type`/`source_ref` columns are kept on the registration row (always `"git"` going forward) rather than removed, to avoid a second schema churn in the same week. Covered by `tests/test_skill_deployment.py`, `tests/test_integration.py`, `tests/test_resilience.py` (all rewritten to deploy from real local git repos).
 
 ---
 
@@ -29,16 +32,16 @@ Test coverage today: `checksums`, `command_executor` (kill switch, allowlist mat
 
 This project is feasible as a controlled internal v1.
 
-The simplified design avoids the expensive parts of the full runtime: no skill stack, no dynamic tool hot-swapping, no lifecycle table, no server-side context budgeting, and no per-provider handler changes. Instead, operators deploy skills from a GitHub URL or ZIP package into versioned S3 artifacts. The registration table records each skill's name, version, source reference, S3 location, checksums, deployment status, and searchable metadata. Local skill folders under `HSK_SKILL_ROOT` are refreshed from the registered S3 artifacts and used as the runtime cache. A skill MCP module is registered with `mcp_daemon_engine` so an agent can call `search_skills`, `get_skill`, and `run_command` through the existing MCP runtime.
+The simplified design avoids the expensive parts of the full runtime: no skill stack, no dynamic tool hot-swapping, no lifecycle table, no server-side context budgeting, and no per-provider handler changes. Instead, operators deploy skills directly from a git remote or a ZIP package — there is no S3 or other artifact store in between. The registration table records each skill's name, version, source reference, resolved git commit, checksums, deployment status, and searchable metadata. Every deployed version's content is cached locally, and the active version is installed under `HSK_SKILL_ROOT` for use as the runtime cache. A skill MCP module is registered with `mcp_daemon_engine` so an agent can call `search_skills`, `get_skill`, and `run_command` through the existing MCP runtime.
 
 The main feasibility risk is not the GraphQL or database work. The main risks are operational and security related:
 
-- The engine must be able to refresh local skill folders from the registered S3 artifacts.
+- The engine must be able to refresh local skill folders straight from git when they are missing or stale.
 - `run_command` must be tightly constrained.
 - Tenant/auth boundaries must be explicit.
 - Search quality must be scoped to a simple v1.
 
-With those constraints made explicit, the project is a reasonable 3-4 week build for a team already familiar with SilvaEngine conventions, S3 artifact handling, and `mcp_daemon_engine`. Add roughly one extra week if auth, deployment, or command-executor isolation patterns need to be created from scratch.
+With those constraints made explicit, the project is a reasonable 3-4 week build for a team already familiar with SilvaEngine conventions, git-based deployment, and `mcp_daemon_engine`. Add roughly one extra week if auth, deployment, or command-executor isolation patterns need to be created from scratch.
 
 ---
 
@@ -57,7 +60,7 @@ The v1 system should let an agent:
 The system should let operators:
 
 1. Author skills as folders in source control.
-2. Deploy skills from a GitHub URL or ZIP package into versioned S3 artifacts.
+2. Deploy skills directly from a git remote — no S3, ZIP upload, or other artifact store in between.
 3. Register, refresh, roll back, disable, or prune skills without exposing the whole catalog to every agent.
 
 ---
@@ -74,7 +77,7 @@ harness_engineering_engine
 
   database
     - stores registration, deployment, and searchable metadata
-    - name, version, description, source, S3 artifact, checksum, deployment status, enabled
+    - name, version, description, source, git_ref, resolved_commit, checksum, deployment status, enabled
 
   GraphQL
     - deploySkillPackage
@@ -102,7 +105,7 @@ agent
   - calls other MCP tools or run_command as needed
 ```
 
-S3 plus the registration table are the deployment source of truth. The database stores metadata and searchable fields, not full skill content. The local file system is the runtime cache used by `skill(name)` and `run_command`.
+Git (for `source_type="git"`) plus the registration table are the deployment source of truth; there is no S3 or other artifact store. A local per-version cache (`handlers/skill_version_cache.py`) holds every deployed version's content on the deploying host, and the active version's content is additionally installed under `HSK_SKILL_ROOT`. The database stores metadata and searchable fields, not full skill content. The local file system is the runtime cache used by `skill(name)` and `run_command`.
 
 ### Skill deployment sequence
 
@@ -110,36 +113,45 @@ S3 plus the registration table are the deployment source of truth. The database 
 sequenceDiagram
     autonumber
     actor Operator
-    participant Source as GitHub or ZIP source
+    participant Source as Git remote
     participant GraphQL as harness_engineering_engine GraphQL
     participant Packager as Skill deployment service
-    participant S3 as Versioned S3 artifacts
+    participant Cache as Local version cache
     participant DB as Skill registration table
 
-    Operator->>GraphQL: deploySkillPackage(source, version?, skillName?)
+    Operator->>GraphQL: deploySkillPackage(source, gitRef?, version?, skillName?)
     GraphQL->>Packager: resolve source and requested version
-    alt GitHub URL
-        Packager->>Source: download repository/ref
+    alt skillName given
+        Packager->>Source: git ls-remote (resolve gitRef to a commit SHA)
+        Source-->>Packager: commit SHA
+        Packager->>DB: compare against the already-registered (source_ref, git_ref, resolved_commit)
+        alt commit unchanged
+            Packager-->>GraphQL: skipped — no clone, no new row
+            GraphQL-->>Operator: deployment result (skipped)
+        else commit changed or unknown
+            Packager->>Source: git clone --depth=1 --branch=gitRef
+            Source-->>Packager: repository content
+        end
+    else skillName not given
+        Packager->>Source: git clone --depth=1 --branch=gitRef
         Source-->>Packager: repository content
-        Packager->>Packager: normalize skill package layout
-        Packager->>Packager: create ZIP artifact
-    else ZIP package
-        Packager->>Source: accept uploaded ZIP
-        Source-->>Packager: ZIP bytes
-        Packager->>Packager: validate ZIP layout
     end
     Packager->>Packager: validate SKILL.md frontmatter
-    Packager->>Packager: compute artifact_checksum and content_checksum
-    Packager->>S3: upload {skill}/{version}/{artifact_checksum}.zip
-    S3-->>Packager: bucket, key, version id, etag
-    Packager->>DB: insert skill version with source, S3 location, checksums, status
+    Packager->>Packager: compute content_checksum
+    Packager->>Cache: store this version's content (HSK_SKILL_ROOT/.hsk-versions/{name}/{version})
+    Packager->>DB: insert skill version with source, git_ref, resolved_commit, checksum, status
     DB-->>Packager: registered row
+    opt this version becomes active (first-ever, or later promoted)
+        Packager->>Cache: install_from_cache into HSK_SKILL_ROOT/{name}
+        Packager->>Packager: write .hsk-skill.json
+    end
     Packager-->>GraphQL: deployment metadata
     GraphQL-->>Operator: deployment result
 
     opt Promote or rollback
         Operator->>GraphQL: promoteSkillVersion(name, version) or rollbackSkill(name, version)
         GraphQL->>DB: mark selected version active
+        GraphQL->>Cache: install_from_cache(name, version) — instant local swap, no remote fetch
         DB-->>GraphQL: active version metadata
         GraphQL-->>Operator: management result
     end
@@ -155,7 +167,7 @@ sequenceDiagram
     participant Module as mcp_skill_provider
     participant GraphQL as harness_engineering_engine GraphQL
     participant DB as Skill registration table
-    participant S3 as Versioned S3 artifacts
+    participant Source as Git remote
     participant Local as Local skill cache
     participant Executor as Guarded command executor
 
@@ -172,13 +184,12 @@ sequenceDiagram
     Daemon->>Module: get_skill(name)
     Module->>GraphQL: skill(name)
     GraphQL->>DB: resolve active enabled skill version
-    DB-->>GraphQL: active version, S3 location, local path, and content checksum
+    DB-->>GraphQL: active version, git_ref, resolved_commit, local path, and content checksum
     GraphQL->>Local: read .hsk-skill.json
-    Local-->>GraphQL: installed version, S3 version id, checksums
+    Local-->>GraphQL: installed version, resolved_commit, checksums
     opt Local version missing, outdated, or inconsistent
-        GraphQL->>S3: download active version ZIP artifact
-        S3-->>GraphQL: versioned package
-        GraphQL->>Local: unpack to temp directory
+        GraphQL->>Source: git fetch pinned to resolved_commit (falls back to a shallow clone of git_ref)
+        Source-->>GraphQL: repository content at that commit
         GraphQL->>Local: validate SKILL.md and recompute checksum
         GraphQL->>Local: atomically replace skill directory
         GraphQL->>Local: write .hsk-skill.json
@@ -218,10 +229,9 @@ Do not hardcode the skill folder or command execution behavior. The engine and s
 | Setting | Required | Purpose |
 |---|---:|---|
 | `HSK_SKILL_ROOT` | Yes | Absolute or app-relative folder containing skill directories. This is the default root for registration and skill file reads. |
-| `HSK_SKILL_ARTIFACT_BUCKET` | Yes for deployed skills | S3 bucket for versioned skill ZIP artifacts. |
-| `HSK_SKILL_ARTIFACT_PREFIX` | No | S3 key prefix for skill artifacts, for example `skills/`. |
+| `HSK_GIT_SSH_KEY_PATH` | No | Alternate SSH private key for git-over-SSH skill sources. Empty means "use the system default identity" (ssh-agent / `~/.ssh/config`); HTTPS remotes use whatever git credential helper is already configured and ignore this setting. |
 | `HSK_SKILL_LOCAL_METADATA_FILE` | No | Metadata filename stored in each local skill directory. Default `.hsk-skill.json`. |
-| `HSK_SKILL_REFRESH_ON_STARTUP` | No | Whether startup compares local metadata with the registration table and S3 artifact metadata. |
+| `HSK_SKILL_REFRESH_ON_STARTUP` | No | Whether startup compares local metadata with the registration table and, for git-sourced skills, refreshes from the git remote. |
 | `HSK_ALLOW_UNREGISTERED_CHANGES` | No | Allows `skill(name)` to return a body when the local content checksum differs from the registered content checksum. Default `false` outside local development. |
 | `HSK_RUN_COMMAND_ENABLED` | No | Global kill switch for guarded command execution. Default `false` until the executor is deployed and audited. |
 | `HSK_RUN_COMMAND_DEFAULT_TIMEOUT_SECONDS` | No | Default timeout when an `allowed_commands` entry does not specify one. |
@@ -231,7 +241,7 @@ Do not hardcode the skill folder or command execution behavior. The engine and s
 
 Configuration should be server-side and tenant-aware where needed. Agent-facing MCP tools must not accept arbitrary filesystem roots, environment variables, or execution policy overrides.
 
-`registerSkills(root, prune)` may accept a `root` argument for admin workflows, but the resolver must normalize it and reject paths outside configured skill roots. The normal deploy path should use `HSK_SKILL_ROOT` directly after local skills have been refreshed from registered S3 artifacts.
+`registerSkills(root, prune)` may accept a `root` argument for admin workflows, but the resolver must normalize it and reject paths outside configured skill roots. The normal deploy path should use `HSK_SKILL_ROOT` directly after local skills have been refreshed from git.
 
 ---
 
@@ -239,8 +249,8 @@ Configuration should be server-side and tenant-aware where needed. Agent-facing 
 
 | Area | Full runtime plan | Simplified v1 |
 |---|---|---|
-| Skill source | Uploaded package / runtime-managed skill | GitHub URL or ZIP package promoted to versioned S3 artifact |
-| Skill storage | DB may hold full body and runtime metadata | S3 stores versioned packages; DB stores registration index; local disk stores runtime cache |
+| Skill source | Uploaded package / runtime-managed skill | Git remote only, sourced directly — no artifact store, no ZIP upload |
+| Skill storage | DB may hold full body and runtime metadata | Git remote is the durable record for git-sourced skills; DB stores registration index; local disk stores a per-version cache plus the runtime cache |
 | Retrieval | Runtime catalog plus skill stack | GraphQL search and get |
 | Agent integration | Handler changes and enabled-tool updates | Skill MCP module in `mcp_daemon_engine` |
 | Tool control | Per-skill tool hot-swap | Fixed tools; skill text names which tools to use |
@@ -317,7 +327,7 @@ Recommendation: use structured `allowed_commands` entries rather than shell-like
 
 The v1 database has one new model: `Skill`.
 
-The database stores registration and deployment metadata only. It does not store the full skill body, helper files, templates, or scripts. Versioned ZIP artifacts live in S3, and the local skill directory is a runtime cache.
+The database stores registration and deployment metadata only. It does not store the full skill body, helper files, templates, or scripts. For a git-sourced skill, the git remote itself is the durable record of content; there is no S3 or other artifact store. A local per-version cache (§7) holds each deployed version's content on the deploying host, and the local skill directory under `HSK_SKILL_ROOT` is the runtime cache.
 
 | Column | Purpose |
 |---|---|
@@ -327,12 +337,10 @@ The database stores registration and deployment metadata only. It does not store
 | `name` | Public identifier, unique per partition. |
 | `version` | Version identifier for the deployed skill package. |
 | `description` | Searchable description. |
-| `source_type` | `github` or `zip`. |
-| `source_ref` | GitHub URL, commit/ref, original ZIP name, or other operator-provided source reference. |
-| `s3_bucket` | Bucket containing the versioned ZIP artifact. |
-| `s3_key` | Key for the versioned ZIP artifact. |
-| `s3_version_id` | S3 object version id when bucket versioning is enabled. |
-| `artifact_checksum` | Hash of the uploaded ZIP artifact. |
+| `source_type` | Always `git`. |
+| `source_ref` | Git remote URL. |
+| `git_ref` | The branch or tag requested at deploy time (`git` only). |
+| `resolved_commit` | The commit SHA `git_ref` resolved to at deploy time (`git` only) — this, not `git_ref` alone, is what refresh pins to and what the cheap redeploy-skip check compares. |
 | `content_checksum` | Hash of the unpacked skill folder content. |
 | `local_path` | Runtime cache path under `HSK_SKILL_ROOT`. Populated by `registerSkills`, not by `deploySkillPackage`. |
 | `deployment_status` | `uploaded`, `registered`, `deployed`, `failed`, `disabled`, or `rolled_back`. |
@@ -347,41 +355,41 @@ For v1, choose one of these local runtime cache assumptions and document it expl
 
 | Option | Feasibility | Notes |
 |---|---|---|
-| Single engine host | Lowest risk | Startup refresh downloads S3 artifacts into local `HSK_SKILL_ROOT`. |
+| Single engine host | Lowest risk | Startup refresh clones git-sourced skills into local `HSK_SKILL_ROOT`. |
 | Shared mounted volume | Feasible | All engine instances can share the refreshed runtime cache. |
-| Per-instance local cache | Feasible | Every instance must run startup or scheduled refresh and validate local metadata. |
+| Per-instance local cache | Feasible | Every instance must run startup or scheduled refresh and validate local metadata; a skill refreshes straight from its git remote, pinned to the registered commit. |
 
-If the engine runs on multiple instances without shared storage, raw local paths are not a deployment source of truth. Treat S3 plus the registration table as authoritative, and treat local directories as disposable caches.
+If the engine runs on multiple instances without shared storage, raw local paths are not a deployment source of truth. Treat git (for `git`-sourced skills) plus the registration table as authoritative, and treat local directories — including the per-version cache — as disposable caches.
 
 ---
 
 ## 7. Skill deployment and management
 
-Deployed skills should be versioned package artifacts. Operators can provide either a GitHub repository URL or a ZIP package.
+Deployed skills should be versioned. Operators provide a git remote (a repository URL, optionally over SSH) — there is no artifact store, and no ZIP upload path, in between.
 
 ### Deploy skills
 
 ```text
-deploySkillPackage(source, version?, skill_name?)
-  -> accept a GitHub repository URL or ZIP package
-  -> if GitHub, download the repository content at the requested ref
-  -> normalize package layout and create a ZIP if needed
+deploySkillPackage(source, gitRef?, version?, skill_name?)
+  -> accept a git remote URL
+  -> if skill_name is known, cheaply resolve gitRef to a commit SHA via
+     `git ls-remote` (no clone) and skip the deploy entirely if that commit is
+     already registered for this skill's (source_ref, git_ref) — git alone
+     decides whether a new version exists
+  -> otherwise, shallow-clone the repository at gitRef
   -> validate that each skill has SKILL.md with required frontmatter
-  -> compute artifact_checksum and content_checksum
-  -> upload ZIP to S3 as a versioned artifact
-  -> register each skill version in the Skill table
-  -> mark deployment_status as uploaded or registered
+  -> compute content_checksum
+  -> cache this version's content locally, keyed by (skill_name, version)
+  -> register each skill version in the Skill table with source, git_ref,
+     resolved_commit, checksum, status
+  -> if this version becomes active, install its cached content into
+     HSK_SKILL_ROOT and write .hsk-skill.json
+  -> mark deployment_status as deployed or registered
 ```
 
-`deploySkillPackage` auto-activates a skill's first-ever version (`is_active=true`, `deployment_status="deployed"`), so a brand-new skill is retrievable immediately after deploy. Every version after that still lands inactive (`is_active=false`, `deployment_status="uploaded"`) and requires an explicit `promoteSkillVersion` before `skill(name)`, `run_command`, or `refreshLocalSkills` will see it (see Known issue #2 above, fixed).
+`deploySkillPackage` auto-activates a skill's first-ever version (`is_active=true`, `deployment_status="deployed"`), so a brand-new skill is retrievable immediately after deploy. Every version after that still lands inactive (`is_active=false`, `deployment_status="registered"`) and requires an explicit `promoteSkillVersion` before `skill(name)`, `run_command`, or `refreshLocalSkills` will see it (see Known issue #2 above, fixed) — but its content is still cached locally the moment it's deployed, so promoting it later is an instant local swap, not a fresh fetch.
 
-S3 key format should make rollback and inspection simple:
-
-```text
-s3://{HSK_SKILL_ARTIFACT_BUCKET}/{HSK_SKILL_ARTIFACT_PREFIX}/{skill_name}/{version}/{artifact_checksum}.zip
-```
-
-If S3 bucket versioning is enabled, store both the logical `version` and the returned `s3_version_id`. The logical version is operator-facing; the S3 version id uniquely identifies the stored object.
+SSH remotes (`git@host:org/repo.git` or `ssh://...`) use the system's default SSH identity (ssh-agent / `~/.ssh/config`); set `HSK_GIT_SSH_KEY_PATH` only when a skill source needs a different key than the host's default. HTTPS remotes use whatever git credential helper is already configured on the host.
 
 ### Local metadata
 
@@ -391,12 +399,10 @@ Each installed skill directory should include local metadata, defaulting to `.hs
 {
   "name": "rfq-assistant",
   "version": "2026.08.24.1",
-  "source_type": "github",
-  "source_ref": "https://github.com/example/skills.git#main",
-  "s3_bucket": "example-skill-artifacts",
-  "s3_key": "skills/rfq-assistant/2026.08.24.1/abc123.zip",
-  "s3_version_id": "3HL4kqtJlcpXrof3A6d...",
-  "artifact_checksum": "abc123",
+  "source_type": "git",
+  "source_ref": "https://github.com/example/skills.git",
+  "git_ref": "main",
+  "resolved_commit": "5c01ea17e962f30ecf5f2c4014d12781abf35e99",
   "content_checksum": "def456",
   "last_refresh_at": "2026-08-24T12:00:00Z"
 }
@@ -410,8 +416,9 @@ This file is not authoritative. It is a fast local comparison point used during 
 refreshLocalSkills()
   -> query enabled registered skill versions
   -> read local .hsk-skill.json files under HSK_SKILL_ROOT
-  -> compare name, version, artifact checksum, content checksum, and S3 version id
-  -> download the registered ZIP from S3 if local metadata is missing, outdated, or inconsistent
+  -> compare name, version, content checksum, and resolved_commit
+  -> for a stale/missing skill, fetch the git remote pinned to resolved_commit
+     (falls back to a shallow clone of git_ref)
   -> unpack into a temporary directory
   -> validate SKILL.md and recompute content checksum
   -> atomically replace the local skill directory
@@ -429,19 +436,20 @@ Refresh should be safe to run repeatedly. Failed refreshes must not leave a part
 skill(name)
   -> resolve the active enabled registration row
   -> read local .hsk-skill.json from the expected skill directory
-  -> compare name, version, artifact checksum, content checksum, and S3 version id
-  -> if local metadata is missing, outdated, or inconsistent, download the active S3 artifact
+  -> compare name, version, content checksum, and resolved_commit
+  -> if local metadata is missing, outdated, or inconsistent, fetch the active
+     version from git, pinned to resolved_commit
   -> unpack and validate into a temporary directory
   -> atomically replace the local skill directory
   -> write .hsk-skill.json
   -> read SKILL.md and return the skill body
 ```
 
-This makes rollback a management-state change. The next `skill(name)` or `run_command(name, ...)` request observes the active registered version, compares it to local metadata, and refreshes from S3 if the local directory is not current.
+This makes rollback a management-state change. `promoteSkillVersion`/`rollbackSkill` swap the local skill directory immediately from the local version cache (no remote fetch); the next `skill(name)` or `run_command(name, ...)` request is a fallback for a host that never cached that version, and refreshes from git if the local directory is not current.
 
 ### Rollback
 
-Rollback should only select a previous registered version as the active version for the skill. It should not directly mutate local skill directories. Do not mutate or overwrite historical S3 artifacts.
+Rollback should only select a previous registered version as the active version for the skill. It should not directly mutate local skill directories beyond swapping in that version's cached content. Do not mutate or overwrite git history.
 
 ```text
 rollbackSkill(name, version)
@@ -449,6 +457,7 @@ rollbackSkill(name, version)
   -> mark the requested version as active
   -> mark the previous active version as inactive or superseded
   -> set deployment_status to rolled_back for management visibility
+  -> swap the local skill directory to the requested version's cached content
   -> return the selected active version metadata
 ```
 
@@ -461,7 +470,7 @@ Management operations should act on registration rows and never require agents t
 | `skills(enabled?, name?)` | Admin catalog view across registered versions and deployment statuses. |
 | `disableSkill(name, version?)` | Disable a specific version or the whole skill so it no longer appears in `searchSkills`. |
 | `promoteSkillVersion(name, version)` | Mark a registered version as the active version. Local disk updates on the next `skill(name)`, `run_command`, or explicit refresh. |
-| `pruneSkillVersions(name, keep)` | Disable or archive old registration rows while keeping immutable S3 artifacts. |
+| `pruneSkillVersions(name, keep)` | Disable old registration rows and reclaim their local version cache; git history remains the durable record, so a pruned version stays recoverable via a redeploy. |
 
 ---
 
@@ -478,7 +487,7 @@ registerSkills(root, prune)
   -> parse YAML frontmatter
   -> validate name, description, allowed_commands
   -> compute content_checksum
-  -> insertUpdateSkill(name, version, description, local_path, s3 location, checksums, deployment_status, enabled)
+  -> insertUpdateSkill(name, version, description, local_path, source, checksums, deployment_status, enabled)
   -> optionally disable rows whose folders no longer exist
 ```
 
@@ -504,17 +513,17 @@ The engine owns the GraphQL contract.
 
 | Operation | Type | Consumer | Purpose |
 |---|---|---|---|
-| `deploySkillPackage(source, version, skillName?)` | Mutation/job | Admin, CI, deploy hook | Accept GitHub URL or ZIP, upload a versioned artifact to S3, and create registration rows. |
-| `refreshLocalSkills()` | Mutation/job | Admin, startup, deploy hook | Proactively compare local metadata to registration/S3 state and refresh local skill directories. |
-| `rollbackSkill(name, version)` | Mutation/job | Admin/operator only | Select a previous registered version as active. Local disk updates on the next skill request or explicit refresh. |
-| `promoteSkillVersion(name, version)` | Mutation/job | Admin/operator only | Mark a registered version as the active version. |
+| `deploySkillPackage(source, version, skillName?)` | Mutation/job | Admin, CI, deploy hook | Accept a git remote, install it directly (no artifact store), and create registration rows. |
+| `refreshLocalSkills()` | Mutation/job | Admin, startup, deploy hook | Proactively compare local metadata to the registration table and refresh git-sourced local skill directories. |
+| `rollbackSkill(name, version)` | Mutation/job | Admin/operator only | Select a previous registered version as active. Swaps local disk from the version cache immediately. |
+| `promoteSkillVersion(name, version)` | Mutation/job | Admin/operator only | Mark a registered version as the active version. Swaps local disk from the version cache immediately. |
 | `disableSkill(name, version?)` | Mutation | Admin/operator only | Disable a skill or skill version from search/retrieval. |
-| `pruneSkillVersions(name, keep)` | Mutation/job | Admin/operator only | Disable or archive old rows without deleting immutable S3 artifacts. |
+| `pruneSkillVersions(name, keep)` | Mutation/job | Admin/operator only | Disable old rows and reclaim their local version cache. |
 | `registerSkills(root, prune)` | Mutation/job | Admin, CI, deploy hook | Scan installed folders and refresh searchable index fields. |
 | `insertUpdateSkill(input)` | Mutation | Admin/job | Upsert one index row. |
 | `skills(enabled)` | Query | Management only | Show the full catalog. Not exposed as an agent MCP tool. |
 | `searchSkills(query, limit)` | Query | Agent through MCP | Return ranked `name` and `description` matches. |
-| `skill(name)` | Query | Agent through MCP | Resolve the active version, refresh local cache from S3 if needed, read `SKILL.md`, and return body, metadata, and allowlist. |
+| `skill(name)` | Query | Agent through MCP | Resolve the active version, refresh local cache from git if needed, read `SKILL.md`, and return body, metadata, and allowlist. |
 
 `skill(name)` should return:
 
@@ -527,10 +536,8 @@ allowed_commands
 local_path
 source_type
 source_ref
-s3_bucket
-s3_key
-s3_version_id
-artifact_checksum
+git_ref
+resolved_commit
 content_checksum
 local_content_checksum
 stale_index
@@ -865,14 +872,14 @@ The skill MCP module should not be able to request a different tenant by passing
 |---|---|---|---|
 | 1 | `Skill` model and migration | One index table, dual PG/DDB through `get_repo()` if required by SilvaEngine conventions. | S |
 | 2 | GraphQL queries/mutations | `deploySkillPackage`, `refreshLocalSkills`, `rollbackSkill`, `promoteSkillVersion`, `disableSkill`, `pruneSkillVersions`, `skills`, `searchSkills`, `skill`, `insertUpdateSkill`, `registerSkills`. | M-L |
-| 3 | Deployment service | GitHub/ZIP intake, ZIP normalization, S3 upload, artifact/version metadata, rollback selection. | M |
+| 3 | Deployment service | Git intake, cheap git-ls-remote version check, local per-version cache, version metadata, rollback selection. | M |
 | 4 | Registration service | Folder scanning, frontmatter parsing, local metadata parsing, validation, checksum, prune behavior. | M |
-| 5 | Local refresh service | Compare local metadata to registration/S3 state, download artifacts, unpack, validate, atomic replacement. | M |
+| 5 | Local refresh service | Compare local metadata to registration state, fetch git-sourced skills straight from their remote, unpack, validate, atomic replacement. | M |
 | 6 | File-backed skill reader | Resolve local path, read `SKILL.md`, split frontmatter/body, detect checksum drift. | S-M |
 | 7 | Skill MCP module | `search_skills`, `get_skill`, `run_command` tool schemas, `mcp_daemon_engine` registration, and GraphQL client. | M |
 | 8 | Guarded command executor | Structured argv validation, path scoping, timeout, output cap, audit logging, dry run. | M |
 | 9 | Python CLI package manager (v1.1) | `harness_engineering_engine` service for package registration, GitHub ref installation, version validation, package-level deployment lock, upgrade flow, and install audit logs. Not part of the P1-P6 delivery plan below; ships as a stub in v1. | M |
-| 10 | Configuration loader | `HSK_SKILL_ROOT`, S3 artifact config, drift policy, command-executor defaults, CLI package defaults, and execution kill switch. | S |
+| 10 | Configuration loader | `HSK_SKILL_ROOT`, git SSH key config, drift policy, command-executor defaults, CLI package defaults, and execution kill switch. | S |
 | 11 | Starter skills and docs | 2-3 real skills, template, authoring README, operational README. | S |
 
 Suggested layout:
@@ -886,15 +893,17 @@ harness_engineering_engine/
   handlers/
     __init__.py
     config.py                # Centralized Config class (like rfq_engine)
-    checksums.py             # Content / artifact checksums
+    checksums.py             # Content checksums
     command_executor.py      # Guarded run_command
     cli_package_manager.py   # CLI package registration/install (v1.1)
-    skill_deployment.py      # deploySkillPackage — GitHub/ZIP intake + S3 + register
+    git_client.py            # git ls-remote / clone, SSH identity handling
+    skill_deployment.py      # deploySkillPackage — git intake + local install + register
     skill_frontmatter.py     # YAML frontmatter parser
     skill_path.py            # Guarded filesystem helpers
     skill_reader.py          # skill(name) — on-demand refresh + body retrieval
-    skill_refresh.py         # refreshLocalSkills — S3 download + atomic replace
+    skill_refresh.py         # refreshLocalSkills — git fetch + atomic replace
     skill_registration.py    # registerSkills — scan + upsert
+    skill_version_cache.py   # per-version local cache backing promote/rollback
   models/
     __init__.py
     dynamodb/
@@ -953,6 +962,8 @@ migration/
     env.py
     versions/
       0001_create_skills.py
+      0002_create_cli_packages.py
+      0003_skills_git_only.py  # drops s3_bucket/s3_key/s3_version_id/artifact_checksum, adds git_ref/resolved_commit
 
 mcp_daemon_engine/
   # existing sibling package
@@ -969,7 +980,7 @@ mcp_daemon_engine/
 
 Deliver:
 
-- Configuration loader for `HSK_SKILL_ROOT`, S3 artifact settings, and stale-index policy.
+- Configuration loader for `HSK_SKILL_ROOT`, git SSH key settings, and stale-index policy.
 - `Skill` index model and migration.
 - `insertUpdateSkill`.
 - `searchSkills`.
@@ -982,7 +993,7 @@ Exit criteria:
 - A GraphQL caller can upsert a skill index row.
 - `searchSkills` returns the sample skill.
 - `skill(name)` returns the live body from `SKILL.md`.
-- If the local skill directory is missing or stale, `skill(name)` refreshes the active registered version from S3 before returning.
+- If the local skill directory is missing or stale, `skill(name)` refreshes the active registered version from git before returning.
 - Skill file reads are constrained to `HSK_SKILL_ROOT`.
 - Tests cover missing skill, disabled skill, malformed frontmatter, and stale checksum.
 
@@ -992,18 +1003,17 @@ Exit criteria:
 
 Deliver:
 
-- `deploySkillPackage` for GitHub URL and ZIP package sources.
-- Versioned ZIP upload to S3.
-- Artifact checksum and unpacked content checksum computation.
-- Registration table fields for source, version, S3 location, checksum, status, and timestamps.
+- `deploySkillPackage` for a git remote source only — no artifact store, no ZIP upload path.
+- Cheap git-only version check (`git ls-remote`) so a redeploy of an unchanged commit is a no-op.
+- Unpacked content checksum computation.
+- Local per-version cache so a deployed-but-inactive version can still be promoted instantly later.
+- Registration table fields for source, git_ref, resolved_commit, checksum, status, and timestamps.
 - `.hsk-skill.json` local metadata format.
 
 Exit criteria:
 
-- A GitHub URL can be downloaded, packaged as ZIP, uploaded to S3, and registered as a skill version.
-- A provided ZIP can be uploaded to S3 and registered as a skill version.
-- Each uploaded artifact has a unique S3 key and checksum.
-- Registration rows include name, version, source reference, S3 location, checksums, deployment status, and registration timestamp.
+- A git remote can be cloned at a ref and registered as a skill version, with the resolved commit SHA recorded.
+- Registration rows include name, version, source reference, git_ref/resolved_commit, checksums, deployment status, and registration timestamp.
 - A skill's first-ever deployed version is visible to `skill(name)` and `run_command` immediately. Every version deployed after that stays inactive until an operator calls `promoteSkillVersion`; document this two-step (deploy, then promote) for upgrades in the P6 operator guide.
 
 ### P3 - Local refresh and registration
@@ -1016,15 +1026,15 @@ Deliver:
 - `registerSkills`.
 - Folder scan and validation.
 - Local metadata comparison.
-- S3 artifact download and atomic local refresh.
+- Git-sourced fetch (pinned to `resolved_commit`) and atomic local refresh.
 - Checksum handling.
-- `prune` behavior.
+- `prune` behavior, including reclaiming the local version cache.
 - Management-only `skills` query.
 
 Exit criteria:
 
 - Startup or refresh detects missing, outdated, or inconsistent local skill directories.
-- The correct version is downloaded from S3 and installed under `HSK_SKILL_ROOT`.
+- The correct version is fetched from git and installed under `HSK_SKILL_ROOT`.
 - Local `.hsk-skill.json` is written with installed version, checksum, source reference, and last refresh time.
 - Rollback changes only the active registered version; local disk changes on the next skill request or explicit refresh.
 - Running `registerSkills` after editing frontmatter updates the DB index.
@@ -1079,7 +1089,7 @@ Deliver:
 - 2-3 real skills.
 - `SKILL.md` template.
 - Authoring guide.
-- Operator guide for GitHub/ZIP deployment, registration, refresh, rollback, and troubleshooting.
+- Operator guide for git deployment, registration, refresh, rollback, and troubleshooting.
 
 Exit criteria:
 
@@ -1099,17 +1109,17 @@ Minimum test coverage for v1:
 | Area | Tests | Status |
 |---|---|---|
 | Frontmatter parsing | Required fields, malformed YAML, duplicate names, optional `allowed_commands`. | Done (`test_frontmatter.py`) |
-| Configuration | Missing `HSK_SKILL_ROOT`, missing S3 artifact config, invalid roots, root traversal, environment-specific defaults. | Done (`test_config.py`) |
-| Checksums | Artifact and content checksum computation. | Done (`test_checksums.py`) |
+| Configuration | Missing `HSK_SKILL_ROOT`, invalid roots, root traversal, environment-specific defaults, git SSH key default. | Done (`test_config.py`) |
+| Checksums | Content checksum computation, determinism, hidden-directory exclusion (including the `.git`-inclusion regression covered by Known issue #4). | Done (`test_checksums.py`) |
 | Command executor | Allowlisted argv accepted, unmatched argv rejected, shell syntax rejected, kill switch, glob match, dry run. | Partial (`test_command_executor.py`) - path traversal, timeout, and output-cap cases still missing |
-| Deployment | GitHub source packaging, ZIP upload, S3 key/version uniqueness, artifact checksum, registration metadata, rollback target selection. | Outstanding |
-| Local refresh | Missing metadata, outdated version, checksum mismatch, failed download, failed validation, atomic replacement, previous version preserved on failure. | Outstanding |
-| On-demand refresh | `skill(name)` compares local metadata with the active registration row, downloads the active S3 version when needed, and returns the refreshed body. | Outstanding |
-| Rollback | `rollbackSkill` only changes active registration state; subsequent `skill(name)` or `refreshLocalSkills` picks up the selected version. | Outstanding |
-| Registration | Idempotent registration, checksum changes, local metadata parsing, prune behavior, disabled rows. | Outstanding |
+| Deployment | Git-based deploy against real local git repos: first-version auto-activation, promote-gating for later versions, redeploy-skip on an unchanged commit. There is no ZIP path to test — `deploySkillPackage` only accepts git. | Done (`test_skill_deployment.py`, `test_integration.py::TestDeploySkillPackage`) |
+| Local refresh | On-demand git refresh of a stale/missing local cache, verified end to end (including a live smoke test against a real GitHub repo, both HTTPS and SSH). | Done (`test_integration.py::TestOnDemandRefresh`) |
+| On-demand refresh | `skill(name)` compares local metadata with the active registration row, fetches from git when needed, and returns the refreshed body. | Done (`test_integration.py::TestOnDemandRefresh`) |
+| Rollback | `promoteSkillVersion`/`rollbackSkill` only change active registration state and swap local disk from the version cache; subsequent `skill(name)` picks up the selected version. | Done (`test_integration.py::TestPromoteRollback`) |
+| Registration | Idempotent registration, checksum changes, local metadata parsing, prune behavior, disabled rows. | Partial (`test_integration.py::TestRegisterSkills`) - prune-reclaims-cache case not yet covered |
 | Search | Exact name match, description match, disabled skill excluded, limit respected. | Outstanding |
-| Retrieval | Missing file, unreadable file, stale checksum, helper file references. | Outstanding |
-| Auth/tenant | Cross-tenant access rejected, management operations restricted. | Outstanding |
+| Retrieval | Missing file, unreadable file, stale checksum, helper file references. | Partial (`test_resilience.py::TestFailureResilience`) |
+| Auth/tenant | Cross-tenant access rejected, management operations restricted. | Partial (`test_resilience.py::test_cross_tenant_isolation`) - RLS only, no auth-layer test |
 | MCP integration | Agent invokes `mcp_daemon_engine`; skill module handles `search_skills -> get_skill -> run_command` happy path. | Outstanding |
 
 The command executor tests are the highest priority because they protect the dangerous behavior; closing the path-traversal, timeout, and output-cap gaps above should come before enabling `HSK_RUN_COMMAND_ENABLED` in any shared environment.
@@ -1121,7 +1131,7 @@ The command executor tests are the highest priority because they protect the dan
 ### Feasible now
 
 - Folder-authored skills.
-- Versioned S3 skill artifacts.
+- Git-sourced skill deployment with no artifact store.
 - Database registration index.
 - Local runtime cache under `HSK_SKILL_ROOT`.
 - GraphQL registration/search/retrieval.
@@ -1130,7 +1140,7 @@ The command executor tests are the highest priority because they protect the dan
 
 ### Feasible with explicit constraints
 
-- Multi-instance deployment, if every instance refreshes from S3 or all instances share the same refreshed skill volume.
+- Multi-instance deployment, if every instance refreshes skills from their git remote or all instances share the same refreshed skill volume.
 - Multi-tenant usage, if every resolver derives partition identity from authenticated context.
 - Command execution, if the guarded executor uses structured argv allowlists and strong path scoping.
 
@@ -1151,13 +1161,13 @@ The command executor tests are the highest priority because they protect the dan
 Proceed with the simplified plan, but make the v1 contract stricter:
 
 1. Treat read-only search/get as the first milestone.
-2. Treat S3 artifacts plus the registration table as the deployment source of truth.
+2. Treat git (for git-sourced skills) plus the registration table as the deployment source of truth; no S3 or other artifact store.
 3. Replace shell-style `allowed_commands` with structured argv allowlists.
 4. Remove arbitrary `cwd` from `run_command`.
 5. Add auth/tenant rules to the GraphQL schema before exposing MCP tools.
 6. Add audit logging for every command execution.
 7. Put skill roots and command-executor policy behind server-side configuration.
-8. Refresh local skill directories from registered S3 versions at startup or through an explicit admin refresh.
+8. Refresh local skill directories from git at startup or through an explicit admin refresh.
 
 Items 1-4 and 7-8 are implemented (see the Implementation status table at the top of this document; items 1 and 2 required the Known-issues fixes above). The remaining gap before wider rollout is test coverage, not architecture: close the path-traversal/timeout/output-cap tests on the command executor and add coverage for deployment, refresh, registration, retrieval, auth/tenant, and MCP integration per §15, and confirm item 5 (auth/tenant rules) against the actual resolver code rather than assuming it from the schema shape.
 

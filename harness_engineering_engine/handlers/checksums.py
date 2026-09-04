@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Checksum helpers for skill artifacts and local content.
+"""Checksum helpers for local skill content.
 
 ``compute_content_checksum`` walks a skill directory and hashes all files
 (excluding the metadata file itself) to produce a deterministic digest of the
-unpacked skill folder.  ``compute_artifact_checksum`` hashes a ZIP artifact.
+unpacked skill folder.
 """
 from __future__ import print_function
 
@@ -28,9 +28,12 @@ def compute_content_checksum(
         raise FileNotFoundError(f"Skill directory not found: {skill_dir}")
 
     hasher = hashlib.new(algorithm)
-    # Sort paths for deterministic ordering across platforms.
-    for root, dirs, files in sorted(os.walk(skill_dir)):
-        # Skip hidden directories such as __pycache__ or .git
+    # os.walk is topdown by default, so mutating `dirs` in place (and
+    # keeping it sorted) both prunes hidden directories such as .git before
+    # descending into them *and* gives deterministic ordering across
+    # platforms. Wrapping the walk in sorted() would defeat the pruning: it
+    # eagerly consumes the whole tree before this filter ever runs.
+    for root, dirs, files in os.walk(skill_dir):
         dirs[:] = sorted(d for d in dirs if not d.startswith("."))
         for fname in sorted(files):
             if fname == metadata_filename:
@@ -48,31 +51,7 @@ def compute_content_checksum(
     return hasher.hexdigest()
 
 
-def compute_artifact_checksum(artifact_path: Path, algorithm: str = "sha256") -> str:
-    """Compute a checksum of a ZIP artifact (or any file)."""
-    if not artifact_path.is_file():
-        raise FileNotFoundError(f"Artifact not found: {artifact_path}")
-
-    hasher = hashlib.new(algorithm)
-    with open(artifact_path, "rb") as fh:
-        while True:
-            chunk = fh.read(8192)
-            if not chunk:
-                break
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-
-def compute_bytes_checksum(data: bytes, algorithm: str = "sha256") -> str:
-    """Compute a checksum of an in-memory bytes object."""
-    hasher = hashlib.new(algorithm)
-    hasher.update(data)
-    return hasher.hexdigest()
-
-
 __all__ = [
     "compute_content_checksum",
-    "compute_artifact_checksum",
-    "compute_bytes_checksum",
 ]
 

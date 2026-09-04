@@ -30,6 +30,8 @@ def deploy() -> List:
                         {"action": "skills", "label": "Skill Catalog"},
                         {"action": "searchSkills", "label": "Search Skills"},
                         {"action": "skill", "label": "Get Skill"},
+                        {"action": "cliPackages", "label": "CLI Package Catalog"},
+                        {"action": "cliPackage", "label": "Get CLI Package"},
                     ],
                     "mutation": [
                         {"action": "insertUpdateSkill", "label": "Insert Update Skill"},
@@ -42,6 +44,9 @@ def deploy() -> List:
                         {"action": "pruneSkillVersions", "label": "Prune Skill Versions"},
                         {"action": "registerSkills", "label": "Register Skills"},
                         {"action": "runCommand", "label": "Run Command"},
+                        {"action": "insertUpdateCliPackage", "label": "Insert Update CLI Package"},
+                        {"action": "deleteCliPackage", "label": "Delete CLI Package"},
+                        {"action": "ensureCliPackage", "label": "Ensure CLI Package"},
                     ],
                     "type": "RequestResponse",
                     "support_methods": ["POST"],

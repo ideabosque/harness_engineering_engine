@@ -132,6 +132,24 @@ def execute_command(
         )
 
     # ------------------------------------------------------------------
+    # Ensure CLI packages are installed (v1.1)
+    # ------------------------------------------------------------------
+    cli_packages = skill_data.get("cli_packages", [])
+    if cli_packages:
+        from .cli_package_manager import ensure_package
+
+        for pkg in cli_packages:
+            pkg_name = pkg.get("package_name") or pkg.get("distribution_name")
+            if not pkg_name:
+                continue
+            result = ensure_package(info, pkg_name)
+            if result.get("status") != "ready":
+                error = result.get("error", "unknown error")
+                raise RuntimeError(
+                    f"CLI package '{pkg_name}' is not ready: {error}"
+                )
+
+    # ------------------------------------------------------------------
     # Normalize argv
     # ------------------------------------------------------------------
     argv_list = _normalize_argv(argv)

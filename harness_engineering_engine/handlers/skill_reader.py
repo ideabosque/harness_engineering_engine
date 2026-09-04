@@ -6,9 +6,8 @@ development plan:
 
 1. Resolve the active enabled registration row.
 2. Read local ``.hsk-skill.json`` metadata.
-3. If local metadata is missing, outdated, or inconsistent, download the
-   active S3 artifact, unpack it, validate, and atomically replace the local
-   directory.
+3. If local metadata is missing, outdated, or inconsistent, fetch the active
+   commit from git, validate, and atomically replace the local directory.
 4. Read ``SKILL.md`` and return the body + metadata.
 """
 from __future__ import print_function
@@ -61,10 +60,8 @@ def _get_active_skill(
                     "description": item.description,
                     "source_type": item.source_type,
                     "source_ref": item.source_ref,
-                    "s3_bucket": item.s3_bucket,
-                    "s3_key": item.s3_key,
-                    "s3_version_id": item.s3_version_id,
-                    "artifact_checksum": item.artifact_checksum,
+                    "git_ref": item.git_ref,
+                    "resolved_commit": item.resolved_commit,
                     "content_checksum": item.content_checksum,
                     "local_path": item.local_path,
                     "deployment_status": item.deployment_status,
@@ -86,9 +83,8 @@ def _local_metadata_matches(
     return (
         metadata.get("name") == active.get("name")
         and metadata.get("version") == active.get("version")
-        and metadata.get("artifact_checksum") == active.get("artifact_checksum")
         and metadata.get("content_checksum") == active.get("content_checksum")
-        and metadata.get("s3_version_id") == active.get("s3_version_id")
+        and metadata.get("resolved_commit") == active.get("resolved_commit")
     )
 
 
@@ -97,9 +93,9 @@ def _download_and_install(
     active: Dict[str, Any],
     root: Path,
 ) -> None:
-    """Download the active S3 artifact and install it into the local cache.
+    """Fetch the active git commit and install it into the local cache.
 
-    This function unpacks to a temporary directory, validates, and then
+    This function clones to a temporary directory, validates, and then
     atomically replaces the skill directory.
     """
     from .skill_refresh import refresh_single_skill
@@ -144,7 +140,7 @@ def skill(
 
     if not _local_metadata_matches(local_metadata, active):
         logger.info(
-            f"Local metadata stale or missing for skill '{name}' — refreshing from S3."
+            f"Local metadata stale or missing for skill '{name}' — refreshing from git."
         )
         _download_and_install(logger, active, skill_root)
         # Re-read metadata after refresh
@@ -180,10 +176,8 @@ def skill(
         "local_path": str(skill_dir),
         "source_type": active.get("source_type"),
         "source_ref": active.get("source_ref"),
-        "s3_bucket": active.get("s3_bucket"),
-        "s3_key": active.get("s3_key"),
-        "s3_version_id": active.get("s3_version_id"),
-        "artifact_checksum": active.get("artifact_checksum"),
+        "git_ref": active.get("git_ref"),
+        "resolved_commit": active.get("resolved_commit"),
         "content_checksum": active.get("content_checksum"),
         "local_content_checksum": local_checksum,
         "stale_index": stale_index,

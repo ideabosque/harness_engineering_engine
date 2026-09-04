@@ -7,23 +7,58 @@ __author__ = "bibow"
 import traceback
 from typing import Any, Dict
 
-from graphene import Argument, Boolean, Field, Mutation, String
+from graphene import Argument, Boolean, Field, List, Mutation, String
 from silvaengine_utility import JSONCamelCase
 
+from ..handlers import skill_version_cache
+from ..handlers.skill_path import resolve_skill_root
+
+
+def _activate_local_content(row: Any) -> None:
+    """Swap the live skill directory to a newly-activated version's content.
+
+    Uses the local version cache populated at deploy time — no remote fetch.
+    A version that was never cached on this host (e.g. deployed from a
+    different host) falls back to the existing on-demand git refresh the
+    next time ``skill(name)`` is read.
+    """
+    skill_root = resolve_skill_root()
+    installed = skill_version_cache.install_from_cache(
+        skill_root, row.name, row.version
+    )
+    if installed:
+        skill_version_cache.write_local_metadata(
+            skill_root / row.name,
+            name=row.name,
+            version=row.version,
+            source_type=row.source_type,
+            source_ref=row.source_ref,
+            git_ref=row.git_ref,
+            resolved_commit=row.resolved_commit,
+            content_checksum=row.content_checksum,
+        )
 
 
 class DeploySkillPackage(Mutation):
-    """Deploy a skill package from a GitHub URL or ZIP file to S3 + DB."""
+    """Deploy a skill package from a git remote.
+
+    Git is the only thing consulted to decide whether a new version exists:
+    when ``skillName`` is given, the target ref is resolved to a commit SHA
+    via a cheap ``git ls-remote`` and the deploy is skipped (see ``skipped``)
+    if that commit is already registered. Otherwise the repo is cloned and
+    installed directly into ``HSK_SKILL_ROOT`` — there is no S3 or other
+    artifact store in between.
+    """
 
     class Arguments:
         source = String(required=True)
-        source_type = String(required=False)
         version = String(required=False)
         skill_name = String(required=False)
         git_ref = String(required=False)
 
     deployed = Field(JSONCamelCase)
     failed = Field(JSONCamelCase)
+    skipped = Field(JSONCamelCase)
     ok = Boolean()
 
     @staticmethod
@@ -34,7 +69,6 @@ class DeploySkillPackage(Mutation):
             result = deploy_skill_package(
                 info,
                 source=kwargs["source"],
-                source_type=kwargs.get("source_type"),
                 version=kwargs.get("version"),
                 skill_name=kwargs.get("skill_name"),
                 git_ref=kwargs.get("git_ref", "main"),
@@ -42,6 +76,7 @@ class DeploySkillPackage(Mutation):
             return DeploySkillPackage(
                 deployed=result["deployed"],
                 failed=result["failed"],
+                skipped=result.get("skipped", []),
                 ok=True,
             )
         except Exception as e:
@@ -152,6 +187,7 @@ class PromoteSkillVersion(Mutation):
                         deployment_status="deployed",
                         updated_by=kwargs["updated_by"],
                     )
+                    _activate_local_content(row)
                     return PromoteSkillVersion(ok=True)
 
             raise ValueError(
@@ -203,6 +239,7 @@ class RollbackSkill(Mutation):
                         deployment_status="deployed",
                         updated_by=kwargs["updated_by"],
                     )
+                    _activate_local_content(row)
                     return RollbackSkill(ok=True)
 
             raise ValueError(
@@ -246,7 +283,7 @@ class DisableSkill(Mutation):
 
 
 class PruneSkillVersions(Mutation):
-    """Disable old skill versions while keeping immutable S3 artifacts."""
+    """Disable old skill version rows while keeping their git history intact."""
 
     class Arguments:
         name = String(required=True)
@@ -271,6 +308,7 @@ class PruneSkillVersions(Mutation):
                 key=lambda r: r.updated_at,
                 reverse=True,
             )
+            skill_root = resolve_skill_root()
             for row in skill_versions[keep:]:
                 repo.insert_update(
                     info,
@@ -278,6 +316,9 @@ class PruneSkillVersions(Mutation):
                     enabled=False,
                     updated_by=updated_by,
                 )
+                # Reclaim local disk — git history remains the durable
+                # record, so the pruned version stays recoverable via a redeploy.
+                skill_version_cache.remove_version(skill_root, row.name, row.version)
 
             return PruneSkillVersions(ok=True)
         except Exception as e:
@@ -295,7 +336,7 @@ class RunCommand(Mutation):
 
     class Arguments:
         name = String(required=True)
-        argv = Argument(JSONCamelCase, required=True)
+        argv = Argument(List(String), required=True)
         workspace_scope = String(required=False)
 
     stdout = String()

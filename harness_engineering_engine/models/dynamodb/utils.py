@@ -7,6 +7,7 @@ __author__ = "bibow"
 import logging
 
 from .skill import SkillModel
+from .cli_package import CliPackageModel
 
 
 def initialize_tables(logger: logging.Logger) -> None:
@@ -15,4 +16,7 @@ def initialize_tables(logger: logging.Logger) -> None:
     if not SkillModel.exists():
         SkillModel.create_table(wait=True, billing_mode="PAY_PER_REQUEST")
         logger.info("Table 'hsk-skills' created.")
+    if not CliPackageModel.exists():
+        CliPackageModel.create_table(wait=True, billing_mode="PAY_PER_REQUEST")
+        logger.info("Table 'hsk-cli-packages' created.")
     logger.info("DynamoDB tables initialized.")

@@ -22,11 +22,9 @@ class SkillType(ObjectType):
     source_type = String()
     source_ref = String()
 
-    s3_bucket = String()
-    s3_key = String()
-    s3_version_id = String()
+    git_ref = String()
+    resolved_commit = String()
 
-    artifact_checksum = String()
     content_checksum = String()
     local_path = String()
 

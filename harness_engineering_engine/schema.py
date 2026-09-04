@@ -9,6 +9,11 @@ from typing import Any, Dict
 
 from graphene import Boolean, Field, Int, ObjectType, ResolveInfo, String
 
+from .mutations.cli_package import (
+    DeleteCliPackage,
+    EnsureCliPackage,
+    InsertUpdateCliPackage,
+)
 from .mutations.skill import DeleteSkill, InsertUpdateSkill
 from .mutations.skill_management import (
     DeploySkillPackage,
@@ -20,7 +25,9 @@ from .mutations.skill_management import (
     RollbackSkill,
     RunCommand,
 )
+from .queries.cli_package import resolve_cli_package, resolve_cli_package_list
 from .queries.skill import resolve_search_skills, resolve_skill, resolve_skill_list
+from .types.cli_package import CliPackageListType, CliPackageType
 from .types.skill import SkillListType, SkillType
 
 
@@ -28,6 +35,8 @@ def type_class():
     return [
         SkillType,
         SkillListType,
+        CliPackageType,
+        CliPackageListType,
     ]
 
 
@@ -39,8 +48,8 @@ class Query(ObjectType):
         SkillListType,
         page_number=Int(required=False),
         limit=Int(required=False),
-        name=String(required=False),
-        description=String(required=False),
+        name_filter=String(name="name", required=False),
+        description_filter=String(name="description", required=False),
         enabled=Boolean(required=False),
         deployment_status=String(required=False),
     )
@@ -55,8 +64,23 @@ class Query(ObjectType):
     # Agent-facing retrieval
     skill = Field(
         SkillType,
-        name=String(required=False),
+        name=String(name="name", required=False),
         skill_uuid=String(required=False),
+    )
+
+    # CLI package admin view
+    cli_packages = Field(
+        CliPackageListType,
+        page_number=Int(required=False),
+        limit=Int(required=False),
+        package_name=String(required=False),
+        status=String(required=False),
+    )
+
+    cli_package = Field(
+        CliPackageType,
+        package_name=String(required=False),
+        cli_package_uuid=String(required=False),
     )
 
     def resolve_ping(self, info: ResolveInfo) -> str:
@@ -77,6 +101,16 @@ class Query(ObjectType):
     ) -> SkillType | None:
         return resolve_skill(info, **kwargs)
 
+    def resolve_cli_packages(
+        self, info: ResolveInfo, **kwargs: Dict[str, Any]
+    ) -> CliPackageListType:
+        return resolve_cli_package_list(info, **kwargs)
+
+    def resolve_cli_package(
+        self, info: ResolveInfo, **kwargs: Dict[str, Any]
+    ) -> CliPackageType | None:
+        return resolve_cli_package(info, **kwargs)
+
 
 class Mutations(ObjectType):
     # Deployment / management
@@ -94,3 +128,8 @@ class Mutations(ObjectType):
 
     # Guarded command execution
     run_command = RunCommand.Field()
+
+    # CLI package management (v1.1)
+    insert_update_cli_package = InsertUpdateCliPackage.Field()
+    delete_cli_package = DeleteCliPackage.Field()
+    ensure_cli_package = EnsureCliPackage.Field()

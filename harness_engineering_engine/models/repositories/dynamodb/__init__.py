@@ -12,9 +12,11 @@ from ..base import EntityRepository
 def register_all(registry: Dict[str, EntityRepository]) -> None:
     """Register all DynamoDB repositories into the given registry dict."""
     from .skill_repo import SkillRepository
+    from .cli_package_repo import CliPackageRepository
 
     repos = [
         SkillRepository(),
+        CliPackageRepository(),
     ]
     for repo in repos:
         registry[repo.entity_type] = repo

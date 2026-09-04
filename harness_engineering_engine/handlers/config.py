@@ -38,7 +38,6 @@ class Config:
     # AWS clients
     aws_lambda = None
     aws_sqs = None
-    aws_s3 = None
 
     # Cache Configuration
     CACHE_TTL = 1800  # 30 minutes default TTL
@@ -57,9 +56,9 @@ class Config:
     # HSK_SKILL_ROOT environment variable.  Resolved at ``initialize()``.
     SKILL_ROOT: str = ""
 
-    # S3 artifact settings for versioned skill packages.
-    SKILL_ARTIFACT_BUCKET: str = ""
-    SKILL_ARTIFACT_PREFIX: str = "skills/"
+    # Path to an alternate SSH private key for git-over-SSH skill sources.
+    # Empty means "use the system default identity" (ssh-agent / ~/.ssh/config).
+    GIT_SSH_KEY_PATH: str = ""
 
     # Local metadata filename stored in each installed skill directory.
     SKILL_LOCAL_METADATA_FILE: str = ".hsk-skill.json"
@@ -91,6 +90,13 @@ class Config:
             "getter": "get_skill",
             "list_resolver": "harness_engineering_engine.queries.skill.resolve_skill_list",
             "cache_keys": ["context:partition_key", "key:skill_uuid"],
+        },
+        "cli_package": {
+            "module": "harness_engineering_engine.models.dynamodb.cli_package",
+            "model_class": "CliPackageModel",
+            "getter": "get_cli_package",
+            "list_resolver": "harness_engineering_engine.queries.cli_package.resolve_cli_package_list",
+            "cache_keys": ["context:partition_key", "key:cli_package_uuid"],
         },
     }
 
@@ -166,13 +172,9 @@ class Config:
         cls.SKILL_ROOT = os.environ.get(
             "HSK_SKILL_ROOT", setting.get("hsk_skill_root", "")
         )
-        cls.SKILL_ARTIFACT_BUCKET = os.environ.get(
-            "HSK_SKILL_ARTIFACT_BUCKET",
-            setting.get("hsk_skill_artifact_bucket", ""),
-        )
-        cls.SKILL_ARTIFACT_PREFIX = os.environ.get(
-            "HSK_SKILL_ARTIFACT_PREFIX",
-            setting.get("hsk_skill_artifact_prefix", "skills/"),
+        cls.GIT_SSH_KEY_PATH = os.environ.get(
+            "HSK_GIT_SSH_KEY_PATH",
+            setting.get("hsk_git_ssh_key_path", ""),
         )
         cls.SKILL_LOCAL_METADATA_FILE = os.environ.get(
             "HSK_SKILL_LOCAL_METADATA_FILE",
@@ -216,7 +218,7 @@ class Config:
 
     @classmethod
     def _initialize_aws_services(cls, setting: Dict[str, Any]) -> None:
-        """Initialize AWS services, such as the S3 client."""
+        """Initialize AWS services (Lambda, SQS) used by the base engine."""
         import boto3
 
         if all(
@@ -233,11 +235,6 @@ class Config:
 
         cls.aws_lambda = boto3.client("lambda", **aws_credentials)
         cls.aws_sqs = boto3.resource("sqs", **aws_credentials)
-        cls.aws_s3 = boto3.client(
-            "s3",
-            **aws_credentials,
-            config=boto3.session.Config(signature_version="s3v4"),
-        )
 
     @classmethod
     def _initialize_dynamodb_meta(cls, setting: Dict[str, Any]) -> None:
@@ -269,15 +266,9 @@ class Config:
             }
             cls.aws_lambda = boto3.client("lambda", **aws_credentials)
             cls.aws_sqs = boto3.resource("sqs", **aws_credentials)
-            cls.aws_s3 = boto3.client(
-                "s3",
-                **aws_credentials,
-                config=boto3.session.Config(signature_version="s3v4"),
-            )
         else:
             cls.aws_lambda = None
             cls.aws_sqs = None
-            cls.aws_s3 = None
 
     # ------------------------------------------------------------------
     # PostgreSQL session
