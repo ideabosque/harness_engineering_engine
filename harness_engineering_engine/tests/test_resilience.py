@@ -125,9 +125,9 @@ class TestFailureResilience:
             tmp, "bad-skill", body="No frontmatter here.\n", no_frontmatter=True
         )
         result = _gql(
-            'mutation Deploy($s: String!) { deploySkillPackage(source: $s, gitRef: "main") { ok failed } }',
+            'mutation Deploy($gitRepositoryUrl: String!) { deploySkillPackage(gitRepositoryUrl: $gitRepositoryUrl, gitRef: "main") { ok failed } }',
             itest,
-            variables={"s": str(remote)},
+            variables={"gitRepositoryUrl": str(remote)},
         )
         assert result.errors is not None or result.data["deploySkillPackage"]["failed"]
 
@@ -136,9 +136,9 @@ class TestFailureResilience:
         tmp = itest["tmp"]
         remote = _make_git_skill_repo(tmp, "disabled-test", body="Disabled skill.")
         _gql(
-            'mutation Deploy($s: String!) { deploySkillPackage(source: $s, gitRef: "main") { ok } }',
+            'mutation Deploy($gitRepositoryUrl: String!) { deploySkillPackage(gitRepositoryUrl: $gitRepositoryUrl, gitRef: "main") { ok } }',
             itest,
-            variables={"s": str(remote)},
+            variables={"gitRepositoryUrl": str(remote)},
         )
         _gql(
             'mutation { disableSkill(name: "disabled-test", updatedBy: "itest") { ok } }',
@@ -162,9 +162,9 @@ class TestFailureResilience:
         remote = _make_git_skill_repo(tmp, "tenant-a-skill", body="Tenant A skill.")
         # Deploy as tenant A
         result_a = _gql(
-            'mutation Deploy($s: String!) { deploySkillPackage(source: $s, gitRef: "main") { ok } }',
+            'mutation Deploy($gitRepositoryUrl: String!) { deploySkillPackage(gitRepositoryUrl: $gitRepositoryUrl, gitRef: "main") { ok } }',
             itest,
-            variables={"s": str(remote)},
+            variables={"gitRepositoryUrl": str(remote)},
         )
         assert result_a.errors is None
 
@@ -196,9 +196,9 @@ class TestFailureResilience:
             tmp, "killswitch-test", body="Killswitch.", allowed_commands=[["python", "--version"]]
         )
         _gql(
-            'mutation Deploy($s: String!) { deploySkillPackage(source: $s, gitRef: "main") { ok } }',
+            'mutation Deploy($gitRepositoryUrl: String!) { deploySkillPackage(gitRepositoryUrl: $gitRepositoryUrl, gitRef: "main") { ok } }',
             itest,
-            variables={"s": str(remote)},
+            variables={"gitRepositoryUrl": str(remote)},
         )
         # Temporarily disable the kill switch
         original = Config.RUN_COMMAND_ENABLED
@@ -227,9 +227,9 @@ class TestDataReconciliation:
         remote = _make_git_skill_repo(tmp, "reconcile-check", body="Reconcile body.")
 
         result = _gql(
-            'mutation Deploy($s: String!) { deploySkillPackage(source: $s, gitRef: "main") { ok deployed } }',
+            'mutation Deploy($gitRepositoryUrl: String!) { deploySkillPackage(gitRepositoryUrl: $gitRepositoryUrl, gitRef: "main") { ok deployed } }',
             itest,
-            variables={"s": str(remote)},
+            variables={"gitRepositoryUrl": str(remote)},
         )
         deployed = result.data["deploySkillPackage"]["deployed"]
         if isinstance(deployed, str):
@@ -247,15 +247,15 @@ class TestDataReconciliation:
         tmp = itest["tmp"]
         remote = _make_git_skill_repo(tmp, "single-active", body="v1")
         _gql(
-            'mutation Deploy($s: String!) { deploySkillPackage(source: $s, gitRef: "main", version: "1.0.0") { ok } }',
+            'mutation Deploy($gitRepositoryUrl: String!) { deploySkillPackage(gitRepositoryUrl: $gitRepositoryUrl, gitRef: "main", version: "1.0.0") { ok } }',
             itest,
-            variables={"s": str(remote)},
+            variables={"gitRepositoryUrl": str(remote)},
         )
         _commit_skill_version(remote, "single-active", body="v2")
         _gql(
-            'mutation Deploy($s: String!) { deploySkillPackage(source: $s, gitRef: "main", version: "2.0.0") { ok } }',
+            'mutation Deploy($gitRepositoryUrl: String!) { deploySkillPackage(gitRepositoryUrl: $gitRepositoryUrl, gitRef: "main", version: "2.0.0") { ok } }',
             itest,
-            variables={"s": str(remote)},
+            variables={"gitRepositoryUrl": str(remote)},
         )
         _gql(
             'mutation { promoteSkillVersion(name: "single-active", version: "2.0.0", updatedBy: "itest") { ok } }',
@@ -275,9 +275,9 @@ class TestDataReconciliation:
         tmp = itest["tmp"]
         remote = _make_git_skill_repo(tmp, "content-check", body="Content check body.")
         _gql(
-            'mutation Deploy($s: String!) { deploySkillPackage(source: $s, gitRef: "main") { ok } }',
+            'mutation Deploy($gitRepositoryUrl: String!) { deploySkillPackage(gitRepositoryUrl: $gitRepositoryUrl, gitRef: "main") { ok } }',
             itest,
-            variables={"s": str(remote)},
+            variables={"gitRepositoryUrl": str(remote)},
         )
         # Read the skill to trigger local refresh
         _gql('query { skill(name: "content-check") { contentChecksum } }', itest)

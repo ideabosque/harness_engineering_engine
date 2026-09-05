@@ -73,9 +73,9 @@ def _get_installed_version(distribution_name: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
-def _pip_install(github_url: str, git_ref: str) -> Dict[str, Any]:
+def _pip_install(git_url: str, git_ref: str) -> Dict[str, Any]:
     """Install a package from a GitHub ref via ``pip install git+url@ref``."""
-    install_target = f"git+{github_url}"
+    install_target = f"git+{git_url}"
     if git_ref:
         install_target = f"{install_target}@{git_ref}"
 
@@ -120,7 +120,7 @@ def _audit_log(
     package_name: str,
     previous_version: Optional[str],
     target_version: str,
-    github_url: str,
+    git_url: str,
     git_ref: str,
     operation: str,
     status: str,
@@ -137,7 +137,7 @@ def _audit_log(
         "package_name": package_name,
         "previous_version": previous_version,
         "target_version": target_version,
-        "github_repository_url": github_url,
+        "git_repository_url": git_url,
         "git_ref": git_ref,
         "operation": operation,
         "status": status,
@@ -154,7 +154,7 @@ def _audit_log(
 def register_cli_package(
     info: Any,
     package_name: str,
-    github_repository_url: str,
+    git_repository_url: str,
     version: str,
     git_ref: Optional[str] = None,
     description: Optional[str] = None,
@@ -200,7 +200,7 @@ def register_cli_package(
             info,
             cli_package_uuid=existing["cli_package_uuid"],
             package_name=package_name,
-            github_repository_url=github_repository_url,
+            git_repository_url=git_repository_url,
             version=version,
             git_ref=git_ref,
             description=description,
@@ -214,7 +214,7 @@ def register_cli_package(
             logger, partition_key, package_name,
             previous_version=existing.get("version"),
             target_version=version,
-            github_url=github_repository_url,
+            git_url=git_repository_url,
             git_ref=git_ref or "",
             operation="registration_update",
             status="succeeded",
@@ -228,7 +228,7 @@ def register_cli_package(
             info,
             cli_package_uuid=str(uuid.uuid4()),
             package_name=package_name,
-            github_repository_url=github_repository_url,
+            git_repository_url=git_repository_url,
             version=version,
             git_ref=git_ref,
             description=description,
@@ -243,7 +243,7 @@ def register_cli_package(
             logger, partition_key, package_name,
             previous_version=None,
             target_version=version,
-            github_url=github_repository_url,
+            git_url=git_repository_url,
             git_ref=git_ref or "",
             operation="registration",
             status="succeeded",
@@ -293,7 +293,7 @@ def ensure_package(info: Any, package_name: str) -> Dict[str, Any]:
             if item.enabled and item.package_name == package_name:
                 registration = {
                     "package_name": item.package_name,
-                    "github_repository_url": item.github_repository_url,
+                    "git_repository_url": item.git_repository_url,
                     "version": item.version,
                     "git_ref": item.git_ref,
                 }
@@ -305,7 +305,7 @@ def ensure_package(info: Any, package_name: str) -> Dict[str, Any]:
         return {"package_name": package_name, "status": "error", "error": msg}
 
     target_version = registration["version"]
-    github_url = registration["github_repository_url"]
+    git_url = registration["git_repository_url"]
     git_ref = registration.get("git_ref") or ""
 
     # The distribution name may differ from the package_name; use package_name
@@ -323,7 +323,7 @@ def ensure_package(info: Any, package_name: str) -> Dict[str, Any]:
             logger, partition_key, package_name,
             previous_version=installed_version,
             target_version=target_version,
-            github_url=github_url,
+            git_url=git_url,
             git_ref=git_ref,
             operation="version_check",
             status="succeeded",
@@ -351,7 +351,7 @@ def ensure_package(info: Any, package_name: str) -> Dict[str, Any]:
                 logger, partition_key, package_name,
                 previous_version=installed_version,
                 target_version=target_version,
-                github_url=github_url,
+                git_url=git_url,
                 git_ref=git_ref,
                 operation="upgrade_skipped",
                 status="succeeded",
@@ -369,7 +369,7 @@ def ensure_package(info: Any, package_name: str) -> Dict[str, Any]:
                 logger, partition_key, package_name,
                 previous_version=installed_version,
                 target_version=target_version,
-                github_url=github_url,
+                git_url=git_url,
                 git_ref=git_ref,
                 operation="upgrade_started",
                 status="started",
@@ -382,7 +382,7 @@ def ensure_package(info: Any, package_name: str) -> Dict[str, Any]:
                     logger, partition_key, package_name,
                     previous_version=installed_version,
                     target_version=target_version,
-                    github_url=github_url,
+                    git_url=git_url,
                     git_ref=git_ref,
                     operation="upgrade_failed",
                     status="failed",
@@ -398,21 +398,21 @@ def ensure_package(info: Any, package_name: str) -> Dict[str, Any]:
                 logger, partition_key, package_name,
                 previous_version=None,
                 target_version=target_version,
-                github_url=github_url,
+                git_url=git_url,
                 git_ref=git_ref,
                 operation="install_started",
                 status="started",
             )
 
         # Install from GitHub ref
-        install_result = _pip_install(github_url, git_ref)
+        install_result = _pip_install(git_url, git_ref)
         if install_result["returncode"] != 0:
             error = install_result["stderr"] or install_result["stdout"]
             _audit_log(
                 logger, partition_key, package_name,
                 previous_version=installed_version,
                 target_version=target_version,
-                github_url=github_url,
+                git_url=git_url,
                 git_ref=git_ref,
                 operation="install_failed",
                 status="failed",
@@ -428,7 +428,7 @@ def ensure_package(info: Any, package_name: str) -> Dict[str, Any]:
                 logger, partition_key, package_name,
                 previous_version=installed_version,
                 target_version=target_version,
-                github_url=github_url,
+                git_url=git_url,
                 git_ref=git_ref,
                 operation="verification_failed",
                 status="failed",
@@ -443,7 +443,7 @@ def ensure_package(info: Any, package_name: str) -> Dict[str, Any]:
             logger, partition_key, package_name,
             previous_version=installed_version,
             target_version=target_version,
-            github_url=github_url,
+            git_url=git_url,
             git_ref=git_ref,
             operation="install_succeeded",
             status="succeeded",
@@ -481,7 +481,7 @@ class CliPackageManager:
         self,
         info: Any,
         package_name: str,
-        github_repository_url: str,
+        git_repository_url: str,
         version: str,
         git_ref: Optional[str] = None,
         description: Optional[str] = None,
@@ -491,7 +491,7 @@ class CliPackageManager:
         return register_cli_package(
             info,
             package_name=package_name,
-            github_repository_url=github_repository_url,
+            git_repository_url=git_repository_url,
             version=version,
             git_ref=git_ref,
             description=description,

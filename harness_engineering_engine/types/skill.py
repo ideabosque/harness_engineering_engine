@@ -19,8 +19,8 @@ class SkillType(ObjectType):
     version = String()
     description = String()
 
-    source_type = String()
-    source_ref = String()
+    # Deployment source
+    git_repository_url = String()
 
     git_ref = String()
     resolved_commit = String()

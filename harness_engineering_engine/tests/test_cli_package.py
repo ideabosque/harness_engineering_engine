@@ -53,7 +53,7 @@ class TestRegisterCliPackage:
         result = register_cli_package(
             FakeInfo(),
             package_name="test-pkg",
-            github_repository_url="https://github.com/example/test-pkg.git",
+            git_repository_url="https://github.com/example/test-pkg.git",
             version="1.0.0",
             git_ref="v1.0.0",
             description="Test package",
@@ -68,7 +68,7 @@ class TestRegisterCliPackage:
         register_cli_package(
             FakeInfo(),
             package_name="update-pkg",
-            github_repository_url="https://github.com/example/update-pkg.git",
+            git_repository_url="https://github.com/example/update-pkg.git",
             version="1.0.0",
             updated_by="itest",
         )
@@ -76,7 +76,7 @@ class TestRegisterCliPackage:
         result = register_cli_package(
             FakeInfo(),
             package_name="update-pkg",
-            github_repository_url="https://github.com/example/update-pkg.git",
+            git_repository_url="https://github.com/example/update-pkg.git",
             version="2.0.0",
             git_ref="v2.0.0",
             updated_by="itest",
@@ -95,7 +95,7 @@ class TestEnsurePackage:
         register_cli_package(
             FakeInfo(),
             package_name="matching-pkg",
-            github_repository_url="https://github.com/example/matching-pkg.git",
+            git_repository_url="https://github.com/example/matching-pkg.git",
             version="0.0.1",  # pytest is typically installed at this version or higher
             git_ref="v0.0.1",
             updated_by="itest",
@@ -113,7 +113,7 @@ class TestEnsurePackage:
         register_cli_package(
             FakeInfo(),
             package_name="missing-pkg",
-            github_repository_url="https://github.com/example/missing-pkg.git",
+            git_repository_url="https://github.com/example/missing-pkg.git",
             version="1.2.3",
             git_ref="v1.2.3",
             updated_by="itest",
@@ -134,7 +134,7 @@ class TestEnsurePackage:
         register_cli_package(
             FakeInfo(),
             package_name="outdated-pkg",
-            github_repository_url="https://github.com/example/outdated-pkg.git",
+            git_repository_url="https://github.com/example/outdated-pkg.git",
             version="2.0.0",
             git_ref="v2.0.0",
             updated_by="itest",
@@ -158,7 +158,7 @@ class TestEnsurePackage:
         register_cli_package(
             FakeInfo(),
             package_name="fail-pkg",
-            github_repository_url="https://github.com/example/fail-pkg.git",
+            git_repository_url="https://github.com/example/fail-pkg.git",
             version="3.0.0",
             git_ref="v3.0.0",
             updated_by="itest",
@@ -179,7 +179,7 @@ class TestEnsurePackage:
         register_cli_package(
             FakeInfo(),
             package_name="verify-fail-pkg",
-            github_repository_url="https://github.com/example/verify-fail-pkg.git",
+            git_repository_url="https://github.com/example/verify-fail-pkg.git",
             version="4.0.0",
             git_ref="v4.0.0",
             updated_by="itest",

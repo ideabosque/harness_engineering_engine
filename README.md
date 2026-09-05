@@ -40,24 +40,116 @@ The engine exposes the following GraphQL operations:
 
 | Operation | Type | Permission |
 |---|---|---|
-| `ping` | Query | — |
-| `skills` | Query | Admin |
-| `search_skills` | Query | Tenant-read |
-| `skill(name)` | Query | Tenant-read |
-| `insertUpdateSkill` | Mutation | Admin |
-| `deleteSkill` | Mutation | Admin |
-| `deploySkillPackage` | Mutation | Admin |
-| `refreshLocalSkills` | Mutation | Admin |
-| `rollbackSkill` | Mutation | Admin |
-| `promoteSkillVersion` | Mutation | Admin |
-| `disableSkill` | Mutation | Admin |
-| `pruneSkillVersions` | Mutation | Admin |
-| `registerSkills` | Mutation | Admin |
-| `runCommand` | Mutation | Tenant-execute + allowlist |
+| `ping` | Query | — | Ping the GraphQL service to confirm it is operational. |
+| `skills` | Query | Admin | Retrieve the full catalog of registered skills (admin use only). |
+| `searchSkills` | Query | Tenant-read | Semantic search across active skills available to an agent. |
+| `skill(name)` | Query | Tenant-read | The primary agent read path. Resolves the active version, refreshes the local cache straight from git if stale, and returns the full `SKILL.md` body alongside metadata. |
+| `cliPackages` | Query | Admin | Retrieve the full catalog of registered CLI packages. |
+| `cliPackage` | Query | Admin | Retrieve metadata for a specific CLI package. |
+| `insertUpdateSkill` | Mutation | Admin | Raw database-level skill registration (superseded by `deploySkillPackage`). |
+| `deleteSkill` | Mutation | Admin | Delete a skill registration from the system. |
+| `deploySkillPackage` | Mutation | Admin | Core deployment path. Clones the given git remote at `gitRef`, resolves the commit SHA, registers the skill, and automatically activates the first-ever version. |
+| `refreshLocalSkills` | Mutation | Admin | Force a local refresh from the database for all skills. |
+| `rollbackSkill` | Mutation | Admin | Revert the active status of a skill to a previous version. |
+| `promoteSkillVersion` | Mutation | Admin | Promote a specific inactive version of a skill to be the active execution version. |
+| `disableSkill` | Mutation | Admin | Disable a skill globally for the tenant. |
+| `pruneSkillVersions` | Mutation | Admin | Clean up old cached versions from the local file system. |
+| `registerSkills` | Mutation | Admin | Scan a local `HSK_SKILL_ROOT` and bulk register all discovered skills. |
+| `runCommand` | Mutation | Tenant-execute | Execute a local subprocess for a skill. Checked against the `allowed_commands` frontmatter array for security, with built-in caps on execution time and output size. |
+| `insertUpdateCliPackage` | Mutation | Admin | Register or update a CLI dependency package mapped to a GitHub repository. |
+| `deleteCliPackage` | Mutation | Admin | Delete a CLI package registration. |
+| `ensureCliPackage` | Mutation | Admin | Forces `pip install git+...` installation of a registered CLI package and verifies the installed version. |
 
-`skill(name: "...")` is the agent-facing read path: it resolves the active version, refreshes the local runtime cache straight from git if it's missing or stale, and returns the full `SKILL.md` body plus `allowedCommands`, `cliPackages`, `localContentChecksum`, and `staleIndex`. Looking up by `skillUuid` instead returns the raw registration row (no body, no refresh) for admin tooling.
+### API Operations Details
 
-`deploySkillPackage` activates a skill's first-ever version automatically. Every version deployed after that stays inactive until you call `promoteSkillVersion(name, version)` — deploy alone never replaces what agents are currently served.
+#### 1. deploySkillPackage (Mutation)
+
+The primary entry point for introducing a new skill into the system. It connects directly to a live Git remote.
+
+```graphql
+mutation {
+  deploySkillPackage(
+    gitRepositoryUrl: "git@github.com:ideabosque/autonomous-integration-testing-specialist.git"
+    gitRef: "main"
+  ) {
+    deployed {
+      skillUuid
+      name
+      version
+      isActive
+      resolvedCommit
+      sourceType
+    }
+    skipped
+    failed {
+      name
+      error
+    }
+  }
+}
+```
+
+* **Behavior**: Clones the repo at `gitRef`, reads `SKILL.md`, calculates internal checksums, and updates the local disk cache (`.hsk-versions/`) and database. Re-deploying an unmodified git commit natively resolves to a cheap `git ls-remote` (no clone) and returns the skill name in the `skipped` array.
+
+#### 2. runCommand (Mutation)
+
+Executes a secure subprocess for a skill. Used heavily by Agent logic to execute associated scripts.
+
+```graphql
+mutation {
+  runCommand(
+    name: "cmd-skill"
+    argv: ["python", "--version"]
+    timeoutSeconds: 30
+    outputLimitBytes: 20000
+  ) {
+    exitCode
+    stdout
+    stderr
+    timedOut
+    truncated
+  }
+}
+```
+
+* **Behavior**: Fails securely with a `PermissionError` if the `argv` does not strictly match an entry in the skill's `allowed_commands` array defined in `SKILL.md`. Safely isolates shell injection and enforces the provided limits.
+
+#### 3. ensureCliPackage (Mutation)
+
+Integrates external Python packages stored on GitHub into the local environment securely.
+
+```graphql
+mutation {
+  ensureCliPackage(packageName: "multilingual-slide-video-agent") {
+    packageName
+    status
+    message
+  }
+}
+```
+
+* **Behavior**: Checks if the previously registered `multilingual-slide-video-agent` version matches the active local environment (`importlib.metadata.version`). If it is missing or out of date, it triggers a `pip install` automatically against the registered GitHub URL.
+
+#### 4. skill (Query)
+
+The single entry point for an agent to actually consume the contents of a skill.
+
+```graphql
+query {
+  skill(name: "autonomous-integration-testing-specialist") {
+    name
+    description
+    body
+    allowedCommands
+    cliPackages
+    gitRepositoryUrl
+    gitRef
+    resolvedCommit
+  }
+}
+```
+
+* **Behavior**: Resolves the skill's active version. If the active local copy on disk is missing or the internal checksum indicates drift, it automatically refreshes from Git pinned perfectly to the `resolvedCommit` recorded in the database. Returns the full `SKILL.md` body for prompt injection.
 
 ### Skills are sourced from git only — no artifact store, no ZIP upload
 

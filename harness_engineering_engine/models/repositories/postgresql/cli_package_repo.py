@@ -107,7 +107,7 @@ class CliPackagePGRepository(EntityRepository):
                 else:
                     field_map = [
                         "package_name",
-                        "github_repository_url",
+                        "git_repository_url",
                         "version",
                         "git_ref",
                         "description",
@@ -152,7 +152,7 @@ class CliPackagePGRepository(EntityRepository):
         }
         for key in [
             "package_name",
-            "github_repository_url",
+            "git_repository_url",
             "version",
             "git_ref",
             "description",

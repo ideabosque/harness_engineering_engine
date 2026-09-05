@@ -66,8 +66,7 @@ class SkillModel(BaseModel):
     description = UnicodeAttribute(null=True)
 
     # Deployment source
-    source_type = UnicodeAttribute(null=True)  # always "git"
-    source_ref = UnicodeAttribute(null=True)  # git remote URL
+    git_repository_url = UnicodeAttribute(null=True)  # git remote URL
 
     # Git pin — the ref requested at deploy time and the commit it resolved to.
     git_ref = UnicodeAttribute(null=True)
@@ -262,8 +261,7 @@ def insert_update_skill(info: ResolveInfo, **kwargs: Dict[str, Any]) -> None:
             "name",
             "version",
             "description",
-            "source_type",
-            "source_ref",
+            "git_repository_url",
             "git_ref",
             "resolved_commit",
             "content_checksum",
@@ -292,8 +290,7 @@ def insert_update_skill(info: ResolveInfo, **kwargs: Dict[str, Any]) -> None:
         "name": SkillModel.name,
         "version": SkillModel.version,
         "description": SkillModel.description,
-        "source_type": SkillModel.source_type,
-        "source_ref": SkillModel.source_ref,
+        "git_repository_url": SkillModel.git_repository_url,
         "git_ref": SkillModel.git_ref,
         "resolved_commit": SkillModel.resolved_commit,
         "content_checksum": SkillModel.content_checksum,

@@ -31,8 +31,7 @@ def _activate_local_content(row: Any) -> None:
             skill_root / row.name,
             name=row.name,
             version=row.version,
-            source_type=row.source_type,
-            source_ref=row.source_ref,
+            git_repository_url=row.git_repository_url,
             git_ref=row.git_ref,
             resolved_commit=row.resolved_commit,
             content_checksum=row.content_checksum,
@@ -51,7 +50,7 @@ class DeploySkillPackage(Mutation):
     """
 
     class Arguments:
-        source = String(required=True)
+        git_repository_url = String(required=True)
         version = String(required=False)
         skill_name = String(required=False)
         git_ref = String(required=False)
@@ -68,7 +67,7 @@ class DeploySkillPackage(Mutation):
 
             result = deploy_skill_package(
                 info,
-                source=kwargs["source"],
+                git_repository_url=kwargs["git_repository_url"],
                 version=kwargs.get("version"),
                 skill_name=kwargs.get("skill_name"),
                 git_ref=kwargs.get("git_ref", "main"),

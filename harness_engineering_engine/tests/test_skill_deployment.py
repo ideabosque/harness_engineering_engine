@@ -92,7 +92,7 @@ class TestDeploySkillPackageActivation:
                 mock_get_repo.return_value = fake_repo
 
                 result = deploy_skill_package(
-                    FakeInfo(), source=str(remote), git_ref="main"
+                    FakeInfo(), git_repository_url=str(remote), git_ref="main"
                 )
 
                 assert result["failed"] == []
@@ -103,7 +103,6 @@ class TestDeploySkillPackageActivation:
                 _, kwargs = fake_repo.insert_update.call_args
                 assert kwargs["is_active"] is True
                 assert kwargs["deployment_status"] == "deployed"
-                assert kwargs["source_type"] == "git"
                 assert kwargs["resolved_commit"]
 
                 # Installed directly into the local skill root — no S3 in between.
@@ -125,7 +124,7 @@ class TestDeploySkillPackageActivation:
                 mock_get_repo.return_value = fake_repo
 
                 result = deploy_skill_package(
-                    FakeInfo(), source=str(remote), git_ref="main"
+                    FakeInfo(), git_repository_url=str(remote), git_ref="main"
                 )
 
                 assert result["failed"] == []
@@ -155,7 +154,7 @@ class TestDeploySkillPackageActivation:
                 # First deploy registers the current commit.
                 first = deploy_skill_package(
                     FakeInfo(),
-                    source=str(remote),
+                    git_repository_url=str(remote),
                     git_ref="main",
                     skill_name="rfq-assistant",
                 )
@@ -164,7 +163,7 @@ class TestDeploySkillPackageActivation:
 
                 registered_row = MagicMock()
                 registered_row.name = "rfq-assistant"
-                registered_row.source_ref = str(remote)
+                registered_row.git_repository_url = str(remote)
                 registered_row.git_ref = "main"
                 registered_row.resolved_commit = resolved_commit
                 fake_repo.list.return_value = FakeSkillListResult([registered_row])
@@ -173,7 +172,7 @@ class TestDeploySkillPackageActivation:
                 # no clone, no new row.
                 second = deploy_skill_package(
                     FakeInfo(),
-                    source=str(remote),
+                    git_repository_url=str(remote),
                     git_ref="main",
                     skill_name="rfq-assistant",
                 )

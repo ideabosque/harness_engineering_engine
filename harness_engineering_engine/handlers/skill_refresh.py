@@ -69,17 +69,17 @@ def refresh_single_skill(
     skill_name = active["name"]
     skill_dir = root / skill_name
 
-    source_ref = active.get("source_ref")
+    git_repository_url = active.get("git_repository_url")
     git_ref = active.get("git_ref") or "main"
     resolved_commit = active.get("resolved_commit")
-    if not source_ref or not resolved_commit:
+    if not git_repository_url or not resolved_commit:
         raise ValueError(f"Skill '{skill_name}' is missing git source metadata.")
 
     logger.info(
-        f"Refreshing skill '{skill_name}' — fetching {source_ref}@{resolved_commit}"
+        f"Refreshing skill '{skill_name}' — fetching {git_repository_url}@{resolved_commit}"
     )
 
-    clone_dir = git_client.clone_at_commit(source_ref, git_ref, resolved_commit)
+    clone_dir = git_client.clone_at_commit(git_repository_url, git_ref, resolved_commit)
     try:
         skill_content_dir = _resolve_skill_content_dir(clone_dir, skill_name)
         parse_skill_file(skill_content_dir / "SKILL.md")
@@ -100,8 +100,7 @@ def refresh_single_skill(
         metadata = {
             "name": skill_name,
             "version": active["version"],
-            "source_type": active.get("source_type"),
-            "source_ref": source_ref,
+            "git_repository_url": git_repository_url,
             "git_ref": git_ref,
             "resolved_commit": resolved_commit,
             "content_checksum": content_checksum,
@@ -156,8 +155,7 @@ def refresh_local_skills(
             active_dict = {
                 "name": name,
                 "version": skill_type.version,
-                "source_type": skill_type.source_type,
-                "source_ref": skill_type.source_ref,
+                "git_repository_url": skill_type.git_repository_url,
                 "git_ref": skill_type.git_ref,
                 "resolved_commit": skill_type.resolved_commit,
                 "content_checksum": skill_type.content_checksum,

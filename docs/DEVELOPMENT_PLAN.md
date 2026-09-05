@@ -24,7 +24,7 @@ Test coverage today (55 tests): `checksums`, `command_executor` (kill switch, al
 2. **Fixed.** A freshly deployed skill had no active version. `handlers/skill_deployment.py::deploy_skill_package` always inserted with `is_active=False` and `deployment_status="uploaded"`, while every agent-facing read path (`skill_reader._get_active_skill`, `refresh_local_skills`, `run_command`) filters on `is_active=True` - so `deploySkillPackage` alone never made a skill retrievable, even for a brand-new skill with no prior version to roll back from. **Applied:** `deploy_skill_package` now checks for an existing active version of the same skill name before registering; if none exists, the new version is inserted with `is_active=True` and `deployment_status="deployed"`, otherwise it lands inactive as before and still requires an explicit `promoteSkillVersion`. Covered by `tests/test_skill_deployment.py`.
 3. **Fixed (architecture change, not a bug).** S3 has been eliminated entirely from skill deployment and retrieval. Skills were, as of this fix, sourced from a git remote (`source_type="git"`) or a local ZIP with no durable remote (`source_type="zip"`); there is no artifact store in between. (ZIP support was subsequently removed too — see Known issue #5.) This invalidates every S3-specific passage written before 2026-09-04 — the rest of this document has been updated to match. `handlers/git_client.py` handles clone/`ls-remote`/SSH-identity concerns; the "is there a new version" check consults git alone (a cheap `git ls-remote`, no clone) via `deploy_skill_package`; `handlers/skill_version_cache.py` provides the local per-version content cache that lets `promoteSkillVersion`/`rollbackSkill` swap versions instantly with no remote fetch. See §2, §6, §7, §9 for current behavior.
 4. **Fixed.** `handlers/checksums.py::compute_content_checksum` wrapped `os.walk()` in `sorted()`, which eagerly consumes the whole tree *before* the hidden-directory prune (`dirs[:] = ...`) ever runs — so `.git` directories were silently included in the checksum despite the code's intent to exclude them. This was invisible under the old ZIP-based flow (an extracted ZIP never contains `.git`), but broke the new git-refresh path outright: two different clone methods produce differently-shaped `.git` internals for the identical commit, so the checksum diverged and refresh failed with a false mismatch error. Found via a live smoke test against a real GitHub repo. **Applied:** removed the `sorted()` wrapper — the existing in-place `dirs[:] = sorted(...)` and `sorted(files)` at each level already give deterministic ordering without needing to consume the whole walk upfront. Covered by `tests/test_checksums.py::test_excludes_hidden_directories`.
-5. **Fixed (architecture change, not a bug).** ZIP-sourced deployment has been removed entirely. `deploySkillPackage` now only accepts a git remote — the `sourceType` GraphQL argument and the `source_type` parameter on `deploy_skill_package()` are gone, since there is only one supported value. The local per-version cache (`handlers/skill_version_cache.py`) is retained: it still makes `promoteSkillVersion`/`rollbackSkill` instant (no remote fetch on every promotion), and every host that never cached a given version falls back to fetching it straight from git, pinned to the registered commit. `source_type`/`source_ref` columns are kept on the registration row (always `"git"` going forward) rather than removed, to avoid a second schema churn in the same week. Covered by `tests/test_skill_deployment.py`, `tests/test_integration.py`, `tests/test_resilience.py` (all rewritten to deploy from real local git repos).
+5. **Fixed (architecture change, not a bug).** ZIP-sourced deployment has been removed entirely. `deploySkillPackage` now only accepts a git remote — the `sourceType` GraphQL argument and the `source_type` parameter on `deploy_skill_package()` are gone, since there is only one supported value. The local per-version cache (`handlers/skill_version_cache.py`) is retained: it still makes `promoteSkillVersion`/`rollbackSkill` instant (no remote fetch on every promotion), and every host that never cached a given version falls back to fetching it straight from git, pinned to the registered commit. `source_type`/`git_repository_url` columns are kept on the registration row (always `"git"` going forward) rather than removed, to avoid a second schema churn in the same week. Covered by `tests/test_skill_deployment.py`, `tests/test_integration.py`, `tests/test_resilience.py` (all rewritten to deploy from real local git repos).
 
 ---
 
@@ -124,7 +124,7 @@ sequenceDiagram
     alt skillName given
         Packager->>Source: git ls-remote (resolve gitRef to a commit SHA)
         Source-->>Packager: commit SHA
-        Packager->>DB: compare against the already-registered (source_ref, git_ref, resolved_commit)
+        Packager->>DB: compare against the already-registered (git_repository_url, git_ref, resolved_commit)
         alt commit unchanged
             Packager-->>GraphQL: skipped — no clone, no new row
             GraphQL-->>Operator: deployment result (skipped)
@@ -338,7 +338,7 @@ The database stores registration and deployment metadata only. It does not store
 | `version` | Version identifier for the deployed skill package. |
 | `description` | Searchable description. |
 | `source_type` | Always `git`. |
-| `source_ref` | Git remote URL. |
+| `git_repository_url` | Git remote URL. |
 | `git_ref` | The branch or tag requested at deploy time (`git` only). |
 | `resolved_commit` | The commit SHA `git_ref` resolved to at deploy time (`git` only) — this, not `git_ref` alone, is what refresh pins to and what the cheap redeploy-skip check compares. |
 | `content_checksum` | Hash of the unpacked skill folder content. |
@@ -374,7 +374,7 @@ deploySkillPackage(source, gitRef?, version?, skill_name?)
   -> accept a git remote URL
   -> if skill_name is known, cheaply resolve gitRef to a commit SHA via
      `git ls-remote` (no clone) and skip the deploy entirely if that commit is
-     already registered for this skill's (source_ref, git_ref) — git alone
+     already registered for this skill's (git_repository_url, git_ref) — git alone
      decides whether a new version exists
   -> otherwise, shallow-clone the repository at gitRef
   -> validate that each skill has SKILL.md with required frontmatter
@@ -400,7 +400,7 @@ Each installed skill directory should include local metadata, defaulting to `.hs
   "name": "rfq-assistant",
   "version": "2026.08.24.1",
   "source_type": "git",
-  "source_ref": "https://github.com/example/skills.git",
+  "git_repository_url": "https://github.com/example/skills.git",
   "git_ref": "main",
   "resolved_commit": "5c01ea17e962f30ecf5f2c4014d12781abf35e99",
   "content_checksum": "def456",
@@ -535,7 +535,7 @@ body
 allowed_commands
 local_path
 source_type
-source_ref
+git_repository_url
 git_ref
 resolved_commit
 content_checksum
@@ -642,7 +642,7 @@ Package registration should include:
 | Field | Purpose |
 |---|---|
 | `package_name` | Unique Python CLI package identifier within the tenant or partition. |
-| `github_repository_url` | Source repository used to install the package. |
+| `git_repository_url` | Source repository used to install the package. |
 | `version` | Current approved package version. |
 | `git_ref` | Tag, release, branch, or commit used for installation. Prefer tags or commits. |
 | `description` | Optional description of the package and purpose. |

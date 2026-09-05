@@ -66,7 +66,7 @@ class CliPackageModel(BaseModel):
 
     # Package identity
     package_name = UnicodeAttribute()
-    github_repository_url = UnicodeAttribute()
+    git_repository_url = UnicodeAttribute()
     version = UnicodeAttribute()
     git_ref = UnicodeAttribute(null=True)
     description = UnicodeAttribute(null=True)
@@ -228,7 +228,7 @@ def insert_update_cli_package(info: ResolveInfo, **kwargs: Dict[str, Any]) -> No
         }
         for key in [
             "package_name",
-            "github_repository_url",
+            "git_repository_url",
             "version",
             "git_ref",
             "description",
@@ -252,7 +252,7 @@ def insert_update_cli_package(info: ResolveInfo, **kwargs: Dict[str, Any]) -> No
 
     field_map = {
         "package_name": CliPackageModel.package_name,
-        "github_repository_url": CliPackageModel.github_repository_url,
+        "git_repository_url": CliPackageModel.git_repository_url,
         "version": CliPackageModel.version,
         "git_ref": CliPackageModel.git_ref,
         "description": CliPackageModel.description,

@@ -29,7 +29,7 @@ def upgrade():
         sa.Column("endpoint_id", sa.String(64)),
         sa.Column("part_id", sa.String(64)),
         sa.Column("package_name", sa.String(255), nullable=False),
-        sa.Column("github_repository_url", sa.String(512), nullable=False),
+        sa.Column("git_repository_url", sa.String(512), nullable=False),
         sa.Column("version", sa.String(64), nullable=False),
         sa.Column("git_ref", sa.String(128)),
         sa.Column("description", sa.Text),

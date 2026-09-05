@@ -19,7 +19,7 @@ class InsertUpdateCliPackage(Mutation):
     class Arguments:
         cli_package_uuid = String(required=False)
         package_name = String(required=True)
-        github_repository_url = String(required=True)
+        git_repository_url = String(required=True)
         version = String(required=True)
         git_ref = String(required=False)
         description = String(required=False)

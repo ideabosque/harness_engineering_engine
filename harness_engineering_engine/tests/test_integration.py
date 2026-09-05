@@ -162,14 +162,14 @@ class TestDeploySkillPackage:
         remote = _make_git_skill_repo(itest["tmp"], "git-skill", body="Git body v1.")
         data = _gql(
             """
-            mutation Deploy($source: String!) {
-                deploySkillPackage(source: $source, gitRef: "main") {
+            mutation Deploy($gitRepositoryUrl: String!) {
+                deploySkillPackage(gitRepositoryUrl: $gitRepositoryUrl, gitRef: "main") {
                     ok deployed failed
                 }
             }
             """,
             itest,
-            variables={"source": str(remote)},
+            variables={"gitRepositoryUrl": str(remote)},
         )["deploySkillPackage"]
         assert data["ok"] is True
         assert data["failed"] == []
@@ -178,7 +178,6 @@ class TestDeploySkillPackage:
         assert len(deployed_list) == 1
 
         deployed = deployed_list[0]
-        assert deployed["sourceType"] == "git"
         assert deployed["isActive"] is True
         assert len(deployed["resolvedCommit"]) == 40
 
@@ -199,12 +198,12 @@ class TestOnDemandRefresh:
         remote = _make_git_skill_repo(tmp, "refresh-skill", body="Fresh body from git.")
         _gql(
             """
-            mutation Deploy($source: String!) {
-                deploySkillPackage(source: $source, gitRef: "main") { ok }
+            mutation Deploy($gitRepositoryUrl: String!) {
+                deploySkillPackage(gitRepositoryUrl: $gitRepositoryUrl, gitRef: "main") { ok }
             }
             """,
             itest,
-            variables={"source": str(remote)},
+            variables={"gitRepositoryUrl": str(remote)},
         )
 
         first = _gql(
@@ -242,14 +241,14 @@ class TestPromoteRollback:
         remote = _make_git_skill_repo(tmp, "lifecycle-skill", body="Body version ONE.")
         r1 = _gql(
             """
-            mutation Deploy($source: String!) {
-                deploySkillPackage(source: $source, gitRef: "main", version: "1.0.0") {
+            mutation Deploy($gitRepositoryUrl: String!) {
+                deploySkillPackage(gitRepositoryUrl: $gitRepositoryUrl, gitRef: "main", version: "1.0.0") {
                     ok deployed
                 }
             }
             """,
             itest,
-            variables={"source": str(remote)},
+            variables={"gitRepositoryUrl": str(remote)},
         )["deploySkillPackage"]
         r1_deployed = r1["deployed"] if isinstance(r1["deployed"], list) else json.loads(r1["deployed"])
         assert r1_deployed[0]["version"] == "1.0.0"
@@ -258,14 +257,14 @@ class TestPromoteRollback:
         _commit_skill_version(remote, "lifecycle-skill", body="Body version TWO.")
         r2 = _gql(
             """
-            mutation Deploy($source: String!) {
-                deploySkillPackage(source: $source, gitRef: "main", version: "2.0.0") {
+            mutation Deploy($gitRepositoryUrl: String!) {
+                deploySkillPackage(gitRepositoryUrl: $gitRepositoryUrl, gitRef: "main", version: "2.0.0") {
                     ok deployed
                 }
             }
             """,
             itest,
-            variables={"source": str(remote)},
+            variables={"gitRepositoryUrl": str(remote)},
         )["deploySkillPackage"]
         r2_deployed = r2["deployed"] if isinstance(r2["deployed"], list) else json.loads(r2["deployed"])
         assert r2_deployed[0]["version"] == "2.0.0"
@@ -323,12 +322,12 @@ class TestRunCommandPolicy:
         )
         _gql(
             """
-            mutation Deploy($source: String!) {
-                deploySkillPackage(source: $source, gitRef: "main") { ok }
+            mutation Deploy($gitRepositoryUrl: String!) {
+                deploySkillPackage(gitRepositoryUrl: $gitRepositoryUrl, gitRef: "main") { ok }
             }
             """,
             itest,
-            variables={"source": str(remote)},
+            variables={"gitRepositoryUrl": str(remote)},
         )
 
     def test_allowlisted_command_executes(self, itest):

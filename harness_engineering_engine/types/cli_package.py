@@ -15,7 +15,7 @@ class CliPackageType(ObjectType):
     cli_package_uuid = String()
 
     package_name = String()
-    github_repository_url = String()
+    git_repository_url = String()
     version = String()
     git_ref = String()
     description = String()

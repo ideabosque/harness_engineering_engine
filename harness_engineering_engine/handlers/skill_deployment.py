@@ -28,7 +28,7 @@ from .config import Config
 from .skill_frontmatter import parse_skill_file
 from .skill_path import resolve_skill_root
 
-SOURCE_TYPE = "git"
+
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +55,7 @@ def _validate_skill_dir(skill_dir: Path) -> Dict[str, Any]:
 
 def deploy_skill_package(
     info: Any,
-    source: str,
+    git_repository_url: str,
     version: Optional[str] = None,
     skill_name: Optional[str] = None,
     git_ref: str = "main",
@@ -63,9 +63,9 @@ def deploy_skill_package(
     """Deploy a skill package from a git remote.
 
     Steps:
-    1. For a named source, cheaply resolve ``git_ref`` to a commit SHA
+    1. For a named git_repository_url, cheaply resolve ``git_ref`` to a commit SHA
        (``git ls-remote`` — no clone) and skip the deploy entirely if that
-       commit is already registered as this skill's source — git is the only
+       commit is already registered as this skill's git_repository_url — git is the only
        thing consulted to decide whether a new version exists.
     2. Otherwise, clone the remote at ``git_ref`` and validate each skill
        found.
@@ -87,18 +87,18 @@ def deploy_skill_package(
     # Cheap version check — git only, no clone.
     # ------------------------------------------------------------------
     if skill_name:
-        sha = git_client.resolve_ref_sha(source, git_ref)
+        sha = git_client.resolve_ref_sha(git_repository_url, git_ref)
         existing = repo.list(info, name=skill_name, enabled=True)
         for row in getattr(existing, "skill_list", []):
             if (
                 row.name == skill_name
-                and row.source_ref == source
+                and row.git_repository_url == git_repository_url
                 and row.git_ref == git_ref
                 and row.resolved_commit == sha
             ):
                 logger.info(
                     f"Skill '{skill_name}' already at commit {sha} for "
-                    f"{source}@{git_ref} — skipping redeploy."
+                    f"{git_repository_url}@{git_ref} — skipping redeploy."
                 )
                 return {"deployed": [], "failed": [], "skipped": [skill_name]}
 
@@ -108,7 +108,7 @@ def deploy_skill_package(
     work_dir = Path(tempfile.mkdtemp(prefix="hsk_deploy_work_"))
     clone_dir: Optional[Path] = None
     try:
-        clone_dir = git_client.clone_at_ref(source, git_ref)
+        clone_dir = git_client.clone_at_ref(git_repository_url, git_ref)
         resolved_commit = git_client.current_commit_sha(clone_dir)
         content_root = clone_dir
 
@@ -120,19 +120,19 @@ def deploy_skill_package(
             if (content_root / "SKILL.md").is_file():
                 skill_dirs = [content_root / "SKILL.md"]
             else:
-                raise ValueError(f"No SKILL.md found in git source '{source}'.")
+                raise ValueError(f"No SKILL.md found in git git_repository_url '{git_repository_url}'.")
 
         for skill_md in skill_dirs:
-            skill_source_dir = skill_md.parent
+            skill_git_repository_url_dir = skill_md.parent
             try:
-                validation = _validate_skill_dir(skill_source_dir)
+                validation = _validate_skill_dir(skill_git_repository_url_dir)
                 resolved_name = skill_name or validation["name"]
                 resolved_version = version or datetime.now(timezone.utc).strftime(
                     "%Y.%m.%d.1"
                 )
 
                 content_checksum = compute_content_checksum(
-                    skill_source_dir, Config.SKILL_LOCAL_METADATA_FILE
+                    skill_git_repository_url_dir, Config.SKILL_LOCAL_METADATA_FILE
                 )
 
                 # Register in database. A skill's first-ever version is
@@ -154,8 +154,8 @@ def deploy_skill_package(
                     name=resolved_name,
                     version=resolved_version,
                     description=validation["description"],
-                    source_type=SOURCE_TYPE,
-                    source_ref=source,
+                     
+                    git_repository_url=git_repository_url,
                     git_ref=git_ref,
                     resolved_commit=resolved_commit,
                     content_checksum=content_checksum,
@@ -172,7 +172,7 @@ def deploy_skill_package(
                 # skill directory — an inactive version stays cached-only
                 # until promoted.
                 skill_version_cache.store_version(
-                    skill_root, resolved_name, resolved_version, skill_source_dir
+                    skill_root, resolved_name, resolved_version, skill_git_repository_url_dir
                 )
                 if activate:
                     skill_version_cache.install_from_cache(
@@ -182,8 +182,8 @@ def deploy_skill_package(
                         skill_root / resolved_name,
                         name=resolved_name,
                         version=resolved_version,
-                        source_type=SOURCE_TYPE,
-                        source_ref=source,
+                         
+                        git_repository_url=git_repository_url,
                         git_ref=git_ref,
                         resolved_commit=resolved_commit,
                         content_checksum=content_checksum,
@@ -199,7 +199,7 @@ def deploy_skill_package(
                         "skill_uuid": skill_uuid,
                         "name": resolved_name,
                         "version": resolved_version,
-                        "source_type": SOURCE_TYPE,
+                        "git_repository_url": git_repository_url,
                         "git_ref": git_ref,
                         "resolved_commit": resolved_commit,
                         "content_checksum": content_checksum,

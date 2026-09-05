@@ -3,21 +3,22 @@
 
 Mirrors the DynamoDB CliPackageModel schema with PostgreSQL-appropriate types.
 """
+
 from __future__ import print_function
 
 __author__ = "bibow"
 
 from sqlalchemy import (
+    TIMESTAMP,
     Boolean,
     Column,
     Index,
     String,
     Text,
-    TIMESTAMP,
     text,
 )
-from sqlalchemy.orm import declared_attr
 from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import declared_attr
 
 from .base import Base, prefixed_index, prefixed_table
 
@@ -44,7 +45,7 @@ class CliPackageModel(Base):
 
     # Package identity
     package_name = Column(String(255), nullable=False)
-    github_repository_url = Column(String(512), nullable=False)
+    git_repository_url = Column(String(512), nullable=False)
     version = Column(String(64), nullable=False)
     git_ref = Column(String(128))
     description = Column(Text)
@@ -68,8 +69,16 @@ class CliPackageModel(Base):
     )
 
     __table_args__ = (
-        Index(prefixed_index("idx_cli_packages_partition_name"), "partition_key", "package_name"),
-        Index(prefixed_index("idx_cli_packages_partition_updated_at"), "partition_key", "updated_at"),
+        Index(
+            prefixed_index("idx_cli_packages_partition_name"),
+            "partition_key",
+            "package_name",
+        ),
+        Index(
+            prefixed_index("idx_cli_packages_partition_updated_at"),
+            "partition_key",
+            "updated_at",
+        ),
     )
 
 

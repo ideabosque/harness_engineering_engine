@@ -48,8 +48,7 @@ class SkillModel(Base):
     description = Column(Text)
 
     # Deployment source
-    source_type = Column(String(16))  # always "git"
-    source_ref = Column(Text)  # git remote URL
+    git_repository_url = Column(Text)  # git remote URL
 
     # Git pin — the ref requested at deploy time and the commit it resolved to.
     git_ref = Column(String(255))
