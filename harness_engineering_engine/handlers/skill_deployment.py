@@ -49,6 +49,50 @@ def _validate_skill_dir(skill_dir: Path) -> Dict[str, Any]:
     }
 
 
+def _ensure_cli_packages(
+    info: Any, cli_packages: List[Dict[str, Any]], updated_by: str
+) -> None:
+    """Auto-register and install every CLI package a skill declares.
+
+    A ``cli_packages`` entry that carries ``git_repository_url`` and
+    ``version`` is registered (upserted) here; one that doesn't is assumed
+    to already be registered separately via ``insertUpdateCliPackage``.
+    Either way, installation is verified immediately (not deferred to first
+    ``runCommand``) — raises on the first failure so the caller's per-skill
+    try/except reports this skill as failed rather than deploying a skill
+    whose declared dependency isn't actually usable yet.
+    """
+    if not cli_packages:
+        return
+
+    from .cli_package_manager import ensure_package, register_cli_package
+
+    for pkg in cli_packages:
+        package_name = pkg.get("package_name") or pkg.get("distribution_name")
+        if not package_name:
+            continue
+
+        git_repository_url = pkg.get("git_repository_url")
+        pkg_version = pkg.get("version")
+        if git_repository_url and pkg_version:
+            register_cli_package(
+                info,
+                package_name=package_name,
+                git_repository_url=git_repository_url,
+                version=pkg_version,
+                git_ref=pkg.get("git_ref"),
+                description=pkg.get("description"),
+                updated_by=updated_by,
+            )
+
+        result = ensure_package(info, package_name)
+        if result.get("status") != "ready":
+            raise RuntimeError(
+                f"CLI package '{package_name}' is not ready: "
+                f"{result.get('error', 'unknown error')}"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Deployment orchestration
 # ---------------------------------------------------------------------------
@@ -113,14 +157,17 @@ def deploy_skill_package(
         content_root = clone_dir
 
         # ------------------------------------------------------------------
-        # Discover skills
+        # Discover skills — recursive, so a SKILL.md nested any number of
+        # subfolders deep (e.g. a monorepo shaped like src/skills/<name>/)
+        # is found, not just one directly under the repo root.
         # ------------------------------------------------------------------
-        skill_dirs = sorted(content_root.glob("*/SKILL.md"))
+        skill_dirs = sorted(
+            p
+            for p in content_root.rglob("SKILL.md")
+            if ".git" not in p.relative_to(content_root).parts
+        )
         if not skill_dirs:
-            if (content_root / "SKILL.md").is_file():
-                skill_dirs = [content_root / "SKILL.md"]
-            else:
-                raise ValueError(f"No SKILL.md found in git git_repository_url '{git_repository_url}'.")
+            raise ValueError(f"No SKILL.md found in git git_repository_url '{git_repository_url}'.")
 
         for skill_md in skill_dirs:
             skill_git_repository_url_dir = skill_md.parent
@@ -133,6 +180,15 @@ def deploy_skill_package(
 
                 content_checksum = compute_content_checksum(
                     skill_git_repository_url_dir, Config.SKILL_LOCAL_METADATA_FILE
+                )
+
+                # Auto-register and install any CLI packages this skill
+                # declares, before the skill itself is registered as
+                # deployed — a broken/uninstallable dependency should fail
+                # this skill's deploy, not leave it registered as active
+                # with a dependency that doesn't actually work yet.
+                _ensure_cli_packages(
+                    info, validation["cli_packages"], updated_by="system"
                 )
 
                 # Register in database. A skill's first-ever version is

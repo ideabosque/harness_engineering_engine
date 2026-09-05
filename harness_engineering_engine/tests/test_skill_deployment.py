@@ -38,18 +38,28 @@ def _run(args, cwd):
     subprocess.run(args, cwd=str(cwd), check=True, capture_output=True, text=True)
 
 
-def _make_git_skill_repo(tmp_path: Path, name: str = "rfq-assistant") -> Path:
-    """Create a local git repo containing one skill, committed on 'main'."""
+def _make_git_skill_repo(
+    tmp_path: Path,
+    name: str = "rfq-assistant",
+    subpath: str = "",
+    cli_packages_yaml: str = "",
+) -> Path:
+    """Create a local git repo containing one skill, committed on 'main'.
+
+    ``subpath`` nests the skill folder under additional parent directories
+    (e.g. ``"src/skills"``) to exercise recursive ``SKILL.md`` discovery.
+    ``cli_packages_yaml`` injects a raw ``cli_packages:`` frontmatter block.
+    """
     remote = tmp_path / "remote"
     remote.mkdir()
     _run(["git", "init", "-q"], cwd=remote)
     _run(["git", "symbolic-ref", "HEAD", "refs/heads/main"], cwd=remote)
 
-    skill_dir = remote / name
-    skill_dir.mkdir()
+    skill_dir = (remote / subpath / name) if subpath else (remote / name)
+    skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(
-        f"---\nname: {name}\ndescription: Test skill.\nallowed_commands: []\n---\n\n"
-        "Body.\n"
+        f"---\nname: {name}\ndescription: Test skill.\nallowed_commands: []\n"
+        f"{cli_packages_yaml}---\n\nBody.\n"
     )
 
     _run(["git", "add", "-A"], cwd=remote)
@@ -178,3 +188,162 @@ class TestDeploySkillPackageActivation:
                 )
                 assert second["deployed"] == []
                 assert second["skipped"] == ["rfq-assistant"]
+
+
+class TestDeploySkillPackageDiscoveryAndCliPackages:
+    """Coverage for P8: recursive SKILL.md discovery and CLI package
+    auto-registration/install (see docs/DEVELOPMENT_PLAN.md Known gap #6)."""
+
+    def _patch_skill_root(self, tmp_path):
+        skill_root = tmp_path / "skill_root"
+        skill_root.mkdir()
+        return patch(
+            "harness_engineering_engine.handlers.skill_deployment.resolve_skill_root",
+            return_value=skill_root,
+        ), skill_root
+
+    def test_nested_skill_md_is_discovered(self, tmp_path):
+        """A SKILL.md nested several directories deep is still found."""
+        remote = _make_git_skill_repo(
+            tmp_path, name="deep-skill", subpath="src/skills/nested"
+        )
+        root_patch, skill_root = self._patch_skill_root(tmp_path)
+
+        with root_patch:
+            with patch(
+                "harness_engineering_engine.handlers.skill_deployment.get_repo"
+            ) as mock_get_repo:
+                fake_repo = MagicMock()
+                fake_repo.list.return_value = FakeSkillListResult([])
+                mock_get_repo.return_value = fake_repo
+
+                result = deploy_skill_package(
+                    FakeInfo(), git_repository_url=str(remote), git_ref="main"
+                )
+
+                assert result["failed"] == []
+                assert len(result["deployed"]) == 1
+                assert result["deployed"][0]["name"] == "deep-skill"
+                assert (skill_root / "deep-skill" / "SKILL.md").is_file()
+
+    def test_declared_cli_package_is_auto_registered_and_installed(self, tmp_path):
+        """A skill declaring cli_packages gets it registered and installed
+        immediately at deploy time — not deferred to first runCommand."""
+        cli_yaml = (
+            "cli_packages:\n"
+            "  - package_name: my-cli-tool\n"
+            "    git_repository_url: https://github.com/example/my-cli-tool.git\n"
+            '    version: "1.0.0"\n'
+        )
+        remote = _make_git_skill_repo(tmp_path, cli_packages_yaml=cli_yaml)
+        root_patch, skill_root = self._patch_skill_root(tmp_path)
+
+        with root_patch:
+            with patch(
+                "harness_engineering_engine.handlers.skill_deployment.get_repo"
+            ) as mock_get_repo:
+                fake_repo = MagicMock()
+                fake_repo.list.return_value = FakeSkillListResult([])
+                mock_get_repo.return_value = fake_repo
+
+                with patch(
+                    "harness_engineering_engine.handlers.cli_package_manager.register_cli_package"
+                ) as mock_register, patch(
+                    "harness_engineering_engine.handlers.cli_package_manager.ensure_package"
+                ) as mock_ensure:
+                    mock_ensure.return_value = {
+                        "package_name": "my-cli-tool",
+                        "version": "1.0.0",
+                        "status": "ready",
+                    }
+
+                    result = deploy_skill_package(
+                        FakeInfo(), git_repository_url=str(remote), git_ref="main"
+                    )
+
+                    assert result["failed"] == []
+                    assert len(result["deployed"]) == 1
+
+                    _, reg_kwargs = mock_register.call_args
+                    assert reg_kwargs["package_name"] == "my-cli-tool"
+                    assert (
+                        reg_kwargs["git_repository_url"]
+                        == "https://github.com/example/my-cli-tool.git"
+                    )
+                    assert reg_kwargs["version"] == "1.0.0"
+
+                    ensure_args, _ = mock_ensure.call_args
+                    assert ensure_args[1] == "my-cli-tool"
+
+    def test_cli_package_install_failure_fails_that_skill(self, tmp_path):
+        """A CLI package that fails to install fails this skill's deploy —
+        the skill is reported in ``failed``, not registered as deployed
+        with a dependency that doesn't actually work."""
+        cli_yaml = (
+            "cli_packages:\n"
+            "  - package_name: broken-tool\n"
+            "    git_repository_url: https://github.com/example/broken-tool.git\n"
+            '    version: "2.0.0"\n'
+        )
+        remote = _make_git_skill_repo(tmp_path, cli_packages_yaml=cli_yaml)
+        root_patch, skill_root = self._patch_skill_root(tmp_path)
+
+        with root_patch:
+            with patch(
+                "harness_engineering_engine.handlers.skill_deployment.get_repo"
+            ) as mock_get_repo:
+                fake_repo = MagicMock()
+                fake_repo.list.return_value = FakeSkillListResult([])
+                mock_get_repo.return_value = fake_repo
+
+                with patch(
+                    "harness_engineering_engine.handlers.cli_package_manager.register_cli_package"
+                ), patch(
+                    "harness_engineering_engine.handlers.cli_package_manager.ensure_package"
+                ) as mock_ensure:
+                    mock_ensure.return_value = {
+                        "package_name": "broken-tool",
+                        "status": "error",
+                        "error": "pip install failed",
+                    }
+
+                    result = deploy_skill_package(
+                        FakeInfo(), git_repository_url=str(remote), git_ref="main"
+                    )
+
+                    assert result["deployed"] == []
+                    assert len(result["failed"]) == 1
+                    assert "broken-tool" in result["failed"][0]["error"]
+
+                    # The skill row is never registered when its declared
+                    # CLI dependency isn't actually usable.
+                    fake_repo.insert_update.assert_not_called()
+                    assert not (skill_root / "rfq-assistant").exists()
+
+    def test_no_cli_packages_declared_is_unaffected(self, tmp_path):
+        """A skill with no cli_packages entries never touches the CLI
+        package manager at all (regression guard for the common case)."""
+        remote = _make_git_skill_repo(tmp_path)
+        root_patch, skill_root = self._patch_skill_root(tmp_path)
+
+        with root_patch:
+            with patch(
+                "harness_engineering_engine.handlers.skill_deployment.get_repo"
+            ) as mock_get_repo:
+                fake_repo = MagicMock()
+                fake_repo.list.return_value = FakeSkillListResult([])
+                mock_get_repo.return_value = fake_repo
+
+                with patch(
+                    "harness_engineering_engine.handlers.cli_package_manager.register_cli_package"
+                ) as mock_register, patch(
+                    "harness_engineering_engine.handlers.cli_package_manager.ensure_package"
+                ) as mock_ensure:
+                    result = deploy_skill_package(
+                        FakeInfo(), git_repository_url=str(remote), git_ref="main"
+                    )
+
+                    assert result["failed"] == []
+                    assert len(result["deployed"]) == 1
+                    mock_register.assert_not_called()
+                    mock_ensure.assert_not_called()

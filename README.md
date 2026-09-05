@@ -183,7 +183,7 @@ passed directly to `Config.initialize()` as an engine setting dict.
 
 ## Skill Format
 
-Each skill is a directory under `HSK_SKILL_ROOT` containing a `SKILL.md`:
+A skill is any directory (anywhere in its git repo — see "Discovery" below) containing a `SKILL.md`:
 
 ```
 skills/
@@ -193,7 +193,7 @@ skills/
       helper.py
 ```
 
-`SKILL.md` uses YAML frontmatter + markdown body:
+`SKILL.md` uses YAML frontmatter + a markdown instruction body. The frontmatter has two required fields and two optional ones:
 
 ```markdown
 ---
@@ -202,10 +202,41 @@ description: >
   What the skill does and when to use it.
 allowed_commands:
   - argv: ["python", "scripts/helper.py"]
+  - argv: ["msv", "pipeline", "status"]
+cli_packages:
+  - package_name: multilingual-slide-video-agent
+    git_repository_url: https://github.com/ideabosque/multilingual_slide_video_production_system.git
+    version: "0.1.0"
+    git_ref: main
 ---
 
 You are a helpful assistant. Follow these steps...
 ```
+
+| Field | Required | Purpose |
+|---|---|---|
+| `name` | Yes | The skill's registered identity — must be unique per tenant. |
+| `description` | Yes | Shown in `searchSkills`/`skill` results; also what agents match against. |
+| `allowed_commands` | No | The **only** commands `runCommand` will ever execute for this skill (see "Security model" below). Omitted or empty means `runCommand` is fully denied for this skill. |
+| `cli_packages` | No | External Python CLI dependencies this skill needs. Each entry needs at least `package_name`; adding `git_repository_url` and `version` makes it auto-registered *and* installed the moment the skill is deployed (see "CLI package dependencies" below) — omit them if the package is already registered separately via `insertUpdateCliPackage`. |
+
+### Discovery
+
+`deploySkillPackage` searches the whole cloned repo recursively for `SKILL.md` files — a skill can live at the repo root, one level down, or nested arbitrarily deep (e.g. a monorepo shaped like `.claude/skills/<name>/SKILL.md`). Every `SKILL.md` found is registered as its own skill, keyed by its own `name`, in a single deploy call.
+
+### Security model — `allowed_commands` is deny-by-default
+
+`allowed_commands` is not a formality — it is the entire boundary between what an admin approved at deploy time and what any tenant-execute caller can trigger via `runCommand` at runtime:
+
+- **Empty or missing means denied, not "anything goes."** `runCommand` raises `PermissionError` immediately if a skill's `allowed_commands` is empty — there is no fallback to "allow everything."
+- **Only exact, listed `argv` entries match.** `runCommand` never invokes a shell (`shell=False`) and never accepts an argv that isn't already in this list.
+- **Only include commands you actually want a tenant-level caller able to run right now, unprompted.** If a CLI package exposes a command meant to be gated behind a human decision in conversation (a publish/approve/delete-style action), leave it out of `allowed_commands` even though the package is installed and the command technically exists — installing a `cli_packages` dependency does not imply every one of its subcommands should be runnable. There is currently no tooling that generates or suggests this list for you; the author has to already know (e.g. via the CLI's own `--help`) which subcommands exist and decide which ones belong here.
+
+### CLI package dependencies
+
+When a `cli_packages` entry includes `git_repository_url` and `version`, `deploySkillPackage` auto-registers it (equivalent to `insertUpdateCliPackage`) and installs/verifies it immediately (equivalent to `ensureCliPackage`) as part of that same deploy call — not deferred to the first `runCommand`. A failed install fails only that skill's entry in the deploy response (`failed`), it does not abort deploying the rest of a multi-skill repo, and the skill itself is not registered if its dependency can't be installed.
+
+There is no database-level link between a skill and a CLI package — the only association is the `package_name` string appearing in both the skill's `SKILL.md` and the `hsk_cli_packages` registration row, matched at read/execute time. Renaming or deleting a CLI package registration does not update or block any skill that still references its old name; the next `runCommand` call for that skill would simply get a "not registered" error from `ensure_package`.
 
 ---
 
