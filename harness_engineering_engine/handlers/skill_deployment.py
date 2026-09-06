@@ -25,6 +25,7 @@ from ..models.repositories import get_repo
 from . import git_client, skill_version_cache
 from .checksums import compute_content_checksum
 from .config import Config
+from .section_generator import generate_missing_sections
 from .skill_frontmatter import parse_skill_file
 from .skill_path import resolve_skill_root
 
@@ -44,9 +45,40 @@ def _validate_skill_dir(skill_dir: Path) -> Dict[str, Any]:
     return {
         "name": parsed.frontmatter.name,
         "description": parsed.frontmatter.description,
+        "body": parsed.body,
         "allowed_commands": parsed.frontmatter.allowed_commands,
         "cli_packages": parsed.frontmatter.cli_packages,
+        "reference_files": parsed.frontmatter.reference_files,
+        # Which frontmatter keys the author actually wrote — distinct from
+        # the parsed values above, which default to [] whether a field was
+        # written as an empty list on purpose or left out entirely. P9
+        # generation must only fill a key that's genuinely absent here.
+        "declared_fields": set(parsed.raw_frontmatter.keys()),
     }
+
+
+def _list_available_files(skill_dir: Path) -> List[str]:
+    """Sorted relative paths of every non-hidden file under ``skill_dir``,
+    excluding ``SKILL.md`` itself.
+
+    Used to ground P9's ``reference_files`` generation in files that
+    actually exist — never an invented path. ``SKILL.md`` is excluded so
+    it's never even a candidate: its content is already returned via
+    ``body`` on every read, so including it again in ``references`` would
+    just be duplication.
+    """
+    files: List[str] = []
+    for path in sorted(skill_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(skill_dir)
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+        rel_str = str(rel).replace("\\", "/")
+        if rel_str == "SKILL.md":
+            continue
+        files.append(rel_str)
+    return files
 
 
 def _ensure_cli_packages(
@@ -178,10 +210,6 @@ def deploy_skill_package(
                     "%Y.%m.%d.1"
                 )
 
-                content_checksum = compute_content_checksum(
-                    skill_git_repository_url_dir, Config.SKILL_LOCAL_METADATA_FILE
-                )
-
                 # Auto-register and install any CLI packages this skill
                 # declares, before the skill itself is registered as
                 # deployed — a broken/uninstallable dependency should fail
@@ -190,6 +218,38 @@ def deploy_skill_package(
                 _ensure_cli_packages(
                     info, validation["cli_packages"], updated_by="system"
                 )
+
+                content_checksum = compute_content_checksum(
+                    skill_git_repository_url_dir, Config.SKILL_LOCAL_METADATA_FILE
+                )
+
+                # P9: propose values for whichever of allowed_commands/
+                # cli_packages/reference_files this skill's own SKILL.md
+                # left entirely absent — never a field the author already
+                # populated, even with an empty list. Regenerated every
+                # deploy (not conditional on a prior sidecar existing); a
+                # redeploy that gets skipped above (unchanged commit)
+                # never reaches here at all, so an unchanged skill never
+                # re-triggers this. A discovered cli_packages entry is
+                # never passed to _ensure_cli_packages above — it only
+                # ever names a package already installed on this host
+                # (no git_repository_url to register/install from).
+                missing_fields = {
+                    field
+                    for field in ("allowed_commands", "cli_packages", "reference_files")
+                    if field not in validation["declared_fields"]
+                }
+                generated_sections: Dict[str, Any] = {}
+                if missing_fields:
+                    generated_sections = generate_missing_sections(
+                        logger,
+                        resolved_name,
+                        validation["description"],
+                        validation["body"],
+                        validation["cli_packages"],
+                        _list_available_files(skill_git_repository_url_dir),
+                        missing_fields,
+                    )
 
                 # Register in database. A skill's first-ever version is
                 # activated automatically so it is immediately retrievable;
@@ -230,6 +290,14 @@ def deploy_skill_package(
                 skill_version_cache.store_version(
                     skill_root, resolved_name, resolved_version, skill_git_repository_url_dir
                 )
+                if generated_sections:
+                    skill_version_cache.write_generated_sidecar(
+                        skill_root,
+                        resolved_name,
+                        resolved_version,
+                        resolved_commit,
+                        generated_sections,
+                    )
                 if activate:
                     skill_version_cache.install_from_cache(
                         skill_root, resolved_name, resolved_version

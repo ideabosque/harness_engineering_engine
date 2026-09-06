@@ -37,6 +37,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+section-generation = [
+    "openai>=1.0",
+]
 postgresql = [
     "SQLAlchemy>=1.4",
     "psycopg2-binary>=2.9",

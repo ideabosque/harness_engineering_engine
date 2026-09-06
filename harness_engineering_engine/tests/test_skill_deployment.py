@@ -18,7 +18,10 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from harness_engineering_engine.handlers.skill_deployment import deploy_skill_package
+from harness_engineering_engine.handlers.skill_deployment import (
+    _list_available_files,
+    deploy_skill_package,
+)
 
 
 class FakeInfo:
@@ -43,12 +46,15 @@ def _make_git_skill_repo(
     name: str = "rfq-assistant",
     subpath: str = "",
     cli_packages_yaml: str = "",
+    allowed_commands_yaml: str = "allowed_commands: []\n",
 ) -> Path:
     """Create a local git repo containing one skill, committed on 'main'.
 
     ``subpath`` nests the skill folder under additional parent directories
     (e.g. ``"src/skills"``) to exercise recursive ``SKILL.md`` discovery.
     ``cli_packages_yaml`` injects a raw ``cli_packages:`` frontmatter block.
+    ``allowed_commands_yaml`` defaults to an explicit empty list — pass
+    ``""`` to omit the field entirely (P9's "genuinely absent" case).
     """
     remote = tmp_path / "remote"
     remote.mkdir()
@@ -58,7 +64,7 @@ def _make_git_skill_repo(
     skill_dir = (remote / subpath / name) if subpath else (remote / name)
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(
-        f"---\nname: {name}\ndescription: Test skill.\nallowed_commands: []\n"
+        f"---\nname: {name}\ndescription: Test skill.\n{allowed_commands_yaml}"
         f"{cli_packages_yaml}---\n\nBody.\n"
     )
 
@@ -347,3 +353,218 @@ class TestDeploySkillPackageDiscoveryAndCliPackages:
                     assert len(result["deployed"]) == 1
                     mock_register.assert_not_called()
                     mock_ensure.assert_not_called()
+
+
+class TestDeploySkillPackageSectionGeneration:
+    """P9: allowed_commands/reference_files generation wired into deploy.
+
+    ``generate_missing_sections`` itself is mocked in every test here — its
+    own logic (skip on no API key, filter to requested fields, etc.) is
+    covered separately in test_section_generator.py. What's under test is
+    skill_deployment.py's wiring: which fields it asks for, and that the
+    result lands in the sidecar (never in SKILL.md, never affecting the
+    registered content_checksum).
+    """
+
+    def _patch_skill_root(self, tmp_path):
+        skill_root = tmp_path / "skill_root"
+        skill_root.mkdir()
+        return patch(
+            "harness_engineering_engine.handlers.skill_deployment.resolve_skill_root",
+            return_value=skill_root,
+        ), skill_root
+
+    def test_generation_requested_when_both_fields_absent(self, tmp_path):
+        remote = _make_git_skill_repo(
+            tmp_path,
+            allowed_commands_yaml="",
+            cli_packages_yaml=(
+                "cli_packages:\n  - package_name: some-pkg\n"
+            ),
+        )
+        root_patch, skill_root = self._patch_skill_root(tmp_path)
+
+        with root_patch:
+            with patch(
+                "harness_engineering_engine.handlers.skill_deployment.get_repo"
+            ) as mock_get_repo:
+                fake_repo = MagicMock()
+                fake_repo.list.return_value = FakeSkillListResult([])
+                mock_get_repo.return_value = fake_repo
+
+                with patch(
+                    "harness_engineering_engine.handlers.skill_deployment."
+                    "_ensure_cli_packages"
+                ), patch(
+                    "harness_engineering_engine.handlers.skill_deployment."
+                    "generate_missing_sections"
+                ) as mock_generate:
+                    mock_generate.return_value = {
+                        "allowed_commands": [{"argv": ["python", "helper.py"]}],
+                        "reference_files": [],
+                    }
+
+                    result = deploy_skill_package(
+                        FakeInfo(), git_repository_url=str(remote), git_ref="main"
+                    )
+
+        assert result["failed"] == []
+        mock_generate.assert_called_once()
+        missing_fields_arg = mock_generate.call_args[0][-1]
+        assert missing_fields_arg == {"allowed_commands", "reference_files"}
+
+        sidecar = skill_root / "rfq-assistant" / ".hsk-generated.json"
+        assert sidecar.is_file()
+        import json as _json
+
+        data = _json.loads(sidecar.read_text())
+        assert data["allowed_commands"] == [{"argv": ["python", "helper.py"]}]
+
+    def test_cli_packages_included_in_missing_fields_when_absent_too(self, tmp_path):
+        """A skill declaring none of the three P9 fields at all — cli_packages
+        must be requested alongside the other two, not just assumed absent
+        because _ensure_cli_packages saw an empty declared list."""
+        remote = _make_git_skill_repo(
+            tmp_path, allowed_commands_yaml="", cli_packages_yaml=""
+        )
+        root_patch, skill_root = self._patch_skill_root(tmp_path)
+
+        with root_patch:
+            with patch(
+                "harness_engineering_engine.handlers.skill_deployment.get_repo"
+            ) as mock_get_repo:
+                fake_repo = MagicMock()
+                fake_repo.list.return_value = FakeSkillListResult([])
+                mock_get_repo.return_value = fake_repo
+
+                with patch(
+                    "harness_engineering_engine.handlers.skill_deployment."
+                    "_ensure_cli_packages"
+                ), patch(
+                    "harness_engineering_engine.handlers.skill_deployment."
+                    "generate_missing_sections",
+                    return_value={},
+                ) as mock_generate:
+                    deploy_skill_package(
+                        FakeInfo(), git_repository_url=str(remote), git_ref="main"
+                    )
+
+        mock_generate.assert_called_once()
+        missing_fields_arg = mock_generate.call_args[0][-1]
+        assert missing_fields_arg == {"allowed_commands", "cli_packages", "reference_files"}
+
+    def test_generation_not_requested_when_both_fields_declared(self, tmp_path):
+        remote = _make_git_skill_repo(
+            tmp_path,
+            allowed_commands_yaml='allowed_commands:\n  - argv: ["python", "a.py"]\n',
+            cli_packages_yaml=(
+                'reference_files:\n  - "notes.md"\ncli_packages:\n'
+                "  - package_name: some-pkg\n"
+            ),
+        )
+        root_patch, skill_root = self._patch_skill_root(tmp_path)
+
+        with root_patch:
+            with patch(
+                "harness_engineering_engine.handlers.skill_deployment.get_repo"
+            ) as mock_get_repo:
+                fake_repo = MagicMock()
+                fake_repo.list.return_value = FakeSkillListResult([])
+                mock_get_repo.return_value = fake_repo
+
+                with patch(
+                    "harness_engineering_engine.handlers.skill_deployment."
+                    "_ensure_cli_packages"
+                ), patch(
+                    "harness_engineering_engine.handlers.skill_deployment."
+                    "generate_missing_sections"
+                ) as mock_generate:
+                    result = deploy_skill_package(
+                        FakeInfo(), git_repository_url=str(remote), git_ref="main"
+                    )
+
+        assert result["failed"] == []
+        mock_generate.assert_not_called()
+        sidecar = skill_root / "rfq-assistant" / ".hsk-generated.json"
+        assert not sidecar.exists()
+
+    def test_generation_requested_for_only_the_absent_field(self, tmp_path):
+        remote = _make_git_skill_repo(
+            tmp_path,
+            allowed_commands_yaml='allowed_commands:\n  - argv: ["python", "a.py"]\n',
+            cli_packages_yaml="cli_packages:\n  - package_name: some-pkg\n",
+        )
+        root_patch, skill_root = self._patch_skill_root(tmp_path)
+
+        with root_patch:
+            with patch(
+                "harness_engineering_engine.handlers.skill_deployment.get_repo"
+            ) as mock_get_repo:
+                fake_repo = MagicMock()
+                fake_repo.list.return_value = FakeSkillListResult([])
+                mock_get_repo.return_value = fake_repo
+
+                with patch(
+                    "harness_engineering_engine.handlers.skill_deployment."
+                    "_ensure_cli_packages"
+                ), patch(
+                    "harness_engineering_engine.handlers.skill_deployment."
+                    "generate_missing_sections",
+                    return_value={},
+                ) as mock_generate:
+                    deploy_skill_package(
+                        FakeInfo(), git_repository_url=str(remote), git_ref="main"
+                    )
+
+        mock_generate.assert_called_once()
+        missing_fields_arg = mock_generate.call_args[0][-1]
+        assert missing_fields_arg == {"reference_files"}
+
+    def test_no_sidecar_written_when_generation_yields_nothing(self, tmp_path):
+        remote = _make_git_skill_repo(
+            tmp_path,
+            allowed_commands_yaml="",
+            cli_packages_yaml="cli_packages:\n  - package_name: some-pkg\n",
+        )
+        root_patch, skill_root = self._patch_skill_root(tmp_path)
+
+        with root_patch:
+            with patch(
+                "harness_engineering_engine.handlers.skill_deployment.get_repo"
+            ) as mock_get_repo:
+                fake_repo = MagicMock()
+                fake_repo.list.return_value = FakeSkillListResult([])
+                mock_get_repo.return_value = fake_repo
+
+                with patch(
+                    "harness_engineering_engine.handlers.skill_deployment."
+                    "_ensure_cli_packages"
+                ), patch(
+                    "harness_engineering_engine.handlers.skill_deployment."
+                    "generate_missing_sections",
+                    return_value={},
+                ):
+                    result = deploy_skill_package(
+                        FakeInfo(), git_repository_url=str(remote), git_ref="main"
+                    )
+
+        assert result["failed"] == []
+        sidecar = skill_root / "rfq-assistant" / ".hsk-generated.json"
+        assert not sidecar.exists()
+
+
+class TestListAvailableFiles:
+    """SKILL.md must never be a reference_files candidate — its content is
+    already returned via body, so including it again would just be
+    duplication."""
+
+    def test_skill_md_is_excluded(self, tmp_path):
+        skill_dir = tmp_path / "my-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("---\nname: x\n---\n\nBody.\n")
+        (skill_dir / "notes.md").write_text("Real reference content.")
+
+        files = _list_available_files(skill_dir)
+
+        assert "SKILL.md" not in files
+        assert "notes.md" in files

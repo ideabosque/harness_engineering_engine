@@ -28,6 +28,7 @@ class SkillFrontmatter:
     description: str = ""
     allowed_commands: List[Dict[str, Any]] = field(default_factory=list)
     cli_packages: List[Dict[str, Any]] = field(default_factory=list)
+    reference_files: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -78,11 +79,16 @@ def parse_frontmatter(text: str) -> ParsedSkill:
     if not isinstance(cli_packages, list):
         raise ValueError("Frontmatter field 'cli_packages' must be a list.")
 
+    reference_files = raw.get("reference_files", [])
+    if not isinstance(reference_files, list):
+        raise ValueError("Frontmatter field 'reference_files' must be a list.")
+
     frontmatter = SkillFrontmatter(
         name=name,
         description=description,
         allowed_commands=allowed_commands,
         cli_packages=cli_packages,
+        reference_files=reference_files,
     )
 
     return ParsedSkill(

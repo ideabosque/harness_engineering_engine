@@ -80,6 +80,16 @@ class Config:
     # Dry-run mode: resolve and validate commands without executing them.
     DRY_RUN: bool = False
 
+    # P9: OpenAI-assisted generation of a skill's missing allowed_commands/
+    # reference_files at deploy time. openai_api_key is deliberately read
+    # from the shared, non-HSK-prefixed setting (same credential other
+    # engines in this gateway already use), not a harness-specific key.
+    # An empty key disables generation entirely (fails open — see
+    # handlers.section_generator).
+    OPENAI_API_KEY: str = ""
+    OPENAI_BASE_URL: str = ""
+    OPENAI_MODEL: str = "gpt-4o-mini"
+
     # ------------------------------------------------------------------
     # Cache entity metadata (DynamoDB only today).
     # ------------------------------------------------------------------
@@ -210,6 +220,15 @@ class Config:
         )
         cls.DRY_RUN = os.environ.get(
             "HSK_DRY_RUN", setting.get("hsk_dry_run", False)
+        )
+        cls.OPENAI_API_KEY = os.environ.get(
+            "OPENAI_API_KEY", setting.get("openai_api_key", "")
+        ) or ""
+        cls.OPENAI_BASE_URL = os.environ.get(
+            "OPENAI_BASE_URL", setting.get("openai_base_url", "")
+        ) or ""
+        cls.OPENAI_MODEL = os.environ.get(
+            "HSK_OPENAI_MODEL", setting.get("hsk_openai_model", "gpt-4o-mini")
         )
 
     # ------------------------------------------------------------------

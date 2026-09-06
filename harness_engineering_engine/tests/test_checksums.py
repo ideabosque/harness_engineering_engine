@@ -6,7 +6,10 @@ from __future__ import print_function
 import tempfile
 from pathlib import Path
 
-from harness_engineering_engine.handlers.checksums import compute_content_checksum
+from harness_engineering_engine.handlers.checksums import (
+    GENERATED_SIDECAR_FILENAME,
+    compute_content_checksum,
+)
 
 
 class TestChecksums:
@@ -63,3 +66,25 @@ class TestChecksums:
             # two clones of the same commit can have differently-shaped
             # .git internals depending on how they were fetched.
             assert with_git == without_git
+
+    def test_excludes_generated_sidecar(self):
+        """P9's sidecar must never affect content_checksum — writing or
+        regenerating it must not make an already-registered version look
+        stale on the next refresh."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill_dir = root / "test-skill"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: test\ndescription: test\n---\n\nBody.\n"
+            )
+
+            without_sidecar = compute_content_checksum(skill_dir, ".hsk-skill.json")
+
+            (skill_dir / GENERATED_SIDECAR_FILENAME).write_text(
+                '{"allowed_commands": [{"argv": ["msv", "status"]}]}'
+            )
+
+            with_sidecar = compute_content_checksum(skill_dir, ".hsk-skill.json")
+
+            assert with_sidecar == without_sidecar

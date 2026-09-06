@@ -42,6 +42,10 @@ class SkillType(ObjectType):
     body = String()
     allowed_commands = Field(JSONCamelCase)
     cli_packages = Field(JSONCamelCase)
+    # P9 — content of every file the skill's reference_files frontmatter
+    # names/globs, resolved and read fresh each call. Never scripts (those
+    # stay execution-only, referenced by path inside allowed_commands).
+    references = Field(JSONCamelCase)
     local_content_checksum = String()
     stale_index = Boolean()
 

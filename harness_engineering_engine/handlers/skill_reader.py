@@ -17,13 +17,56 @@ __author__ = "bibow"
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from ..models.repositories import get_repo
+from . import skill_version_cache
 from .checksums import compute_content_checksum
 from .config import Config
 from .skill_frontmatter import parse_skill_file
 from .skill_path import resolve_skill_root
+
+
+def _resolve_references(skill_dir: Path, patterns: List[str]) -> List[Dict[str, Any]]:
+    """Read every file matched by ``patterns`` (paths or globs) into
+    ``{"path": ..., "content": ...}`` entries.
+
+    Every match is containment-checked against ``skill_dir`` — a pattern
+    that resolves outside of it (e.g. via ``../``) is silently skipped,
+    same trust boundary as every other path input in this project. An
+    unreadable/binary file is skipped rather than raising, since this is
+    best-effort enrichment, not something that should ever break
+    ``skill(name)`` for the whole skill. ``SKILL.md`` itself is always
+    excluded — its content is already returned via ``body`` — regardless
+    of whether it came from the author's own ``reference_files`` or the
+    generated sidecar.
+    """
+    references: List[Dict[str, Any]] = []
+    seen: set = set()
+    skill_dir_resolved = skill_dir.resolve()
+
+    for pattern in patterns:
+        for path in sorted(skill_dir.glob(pattern)):
+            if not path.is_file():
+                continue
+            try:
+                path.resolve().relative_to(skill_dir_resolved)
+            except ValueError:
+                continue  # escaped skill_dir — skip
+
+            rel = str(path.relative_to(skill_dir)).replace("\\", "/")
+            if rel in seen or rel == "SKILL.md":
+                continue
+            seen.add(rel)
+
+            try:
+                content = path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+
+            references.append({"path": rel, "content": content})
+
+    return references
 
 
 def _get_active_skill(
@@ -165,13 +208,40 @@ def skill(
             f"checksum and HSK_ALLOW_UNREGISTERED_CHANGES is false."
         )
 
+    # ------------------------------------------------------------------
+    # P9: fill any of allowed_commands/reference_files that SKILL.md left
+    # entirely absent from the generated-sections sidecar (never a field
+    # the author actually declared, even as an empty list — see
+    # docs/DEVELOPMENT_PLAN.md §5). A sidecar left over from a different
+    # commit than the one currently active is ignored, not trusted.
+    # ------------------------------------------------------------------
+    declared_fields = set(parsed.raw_frontmatter.keys())
+    generated = skill_version_cache.read_generated_sidecar(skill_dir)
+    if generated and generated.get("resolved_commit") != active.get("resolved_commit"):
+        generated = None
+
+    allowed_commands = parsed.frontmatter.allowed_commands
+    if "allowed_commands" not in declared_fields and generated:
+        allowed_commands = generated.get("allowed_commands", allowed_commands)
+
+    reference_files = parsed.frontmatter.reference_files
+    if "reference_files" not in declared_fields and generated:
+        reference_files = generated.get("reference_files", reference_files)
+
+    cli_packages = parsed.frontmatter.cli_packages
+    if "cli_packages" not in declared_fields and generated:
+        cli_packages = generated.get("cli_packages", cli_packages)
+
+    references = _resolve_references(skill_dir, reference_files)
+
     return {
         "name": active["name"],
         "version": active["version"],
         "description": active["description"],
         "body": parsed.body,
-        "allowed_commands": parsed.frontmatter.allowed_commands,
-        "cli_packages": parsed.frontmatter.cli_packages,
+        "allowed_commands": allowed_commands,
+        "cli_packages": cli_packages,
+        "references": references,
         "local_path": str(skill_dir),
         "git_repository_url": active.get("git_repository_url"),
         "git_ref": active.get("git_ref"),

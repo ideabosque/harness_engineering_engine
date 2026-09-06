@@ -13,6 +13,14 @@ import hashlib
 import os
 from pathlib import Path
 
+# Fixed filename for the P9 "auto-generated sections" sidecar
+# (allowed_commands/reference_files an author left out of SKILL.md,
+# proposed via OpenAI at deploy time). Always excluded from the checksum,
+# the same way the local metadata file is — writing or regenerating it
+# must never change the skill's registered content_checksum. Unlike the
+# metadata filename, this one isn't user-configurable.
+GENERATED_SIDECAR_FILENAME = ".hsk-generated.json"
+
 
 def compute_content_checksum(
     skill_dir: Path,
@@ -21,11 +29,14 @@ def compute_content_checksum(
 ) -> str:
     """Compute a deterministic checksum of all files under ``skill_dir``.
 
-    The metadata file (``metadata_filename``) is excluded so that writing it
-    does not alter the checksum of the skill it describes.
+    The metadata file (``metadata_filename``) and the generated-sections
+    sidecar (``GENERATED_SIDECAR_FILENAME``) are excluded so that writing
+    either does not alter the checksum of the skill they describe.
     """
     if not skill_dir.is_dir():
         raise FileNotFoundError(f"Skill directory not found: {skill_dir}")
+
+    excluded_filenames = {metadata_filename, GENERATED_SIDECAR_FILENAME}
 
     hasher = hashlib.new(algorithm)
     # os.walk is topdown by default, so mutating `dirs` in place (and
@@ -36,7 +47,7 @@ def compute_content_checksum(
     for root, dirs, files in os.walk(skill_dir):
         dirs[:] = sorted(d for d in dirs if not d.startswith("."))
         for fname in sorted(files):
-            if fname == metadata_filename:
+            if fname in excluded_filenames:
                 continue
             fpath = Path(root) / fname
             relative = fpath.relative_to(skill_dir)
@@ -53,5 +64,5 @@ def compute_content_checksum(
 
 __all__ = [
     "compute_content_checksum",
+    "GENERATED_SIDECAR_FILENAME",
 ]
-
