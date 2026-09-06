@@ -153,7 +153,16 @@ def skill(
     """Resolve the active enabled skill version and return its body + metadata.
 
     This is the primary agent-facing read path.  It handles on-demand refresh
-    from S3 when the local cache is stale or missing.
+    from git when the local cache is stale or missing.
+
+    When the local cache is stale and a git refresh is needed, the refresh is
+    launched in a background thread (via ``skill_refresh_tracker``) instead
+    of blocking.  In that case, if ``SKILL.md`` is not yet available locally,
+    the function returns a ``status: "refreshing"`` signal so the caller can
+    retry after the refresh completes.  If ``SKILL.md`` IS available (stale
+    but present), the function returns the stale content immediately while
+    the refresh runs in the background — the caller gets a useful response
+    on the first call and updated content on the next call.
     """
     logger = info.context.get("logger") or logging.getLogger(__name__)
     partition_key = info.context.get("partition_key")
@@ -181,14 +190,69 @@ def skill(
             local_metadata = None
 
     if not _local_metadata_matches(local_metadata, active):
-        logger.info(
-            f"Local metadata stale or missing for skill '{name}' — refreshing from git."
-        )
-        _download_and_install(logger, active, skill_root)
-        # Re-read metadata after refresh
-        if metadata_file.is_file():
-            with open(metadata_file, "r", encoding="utf-8") as fh:
-                local_metadata = json.load(fh)
+        # Check if a background refresh is already in progress
+        from .skill_refresh_tracker import is_refreshing, launch_refresh
+
+        if is_refreshing(partition_key, name):
+            logger.info(
+                f"Refresh already in progress for skill '{name}' — "
+                f"returning {'stale' if skill_dir.is_dir() else 'refreshing'} signal."
+            )
+            if not (skill_dir / "SKILL.md").is_file():
+                # No local content at all — tell the caller to retry
+                return {
+                    "name": active["name"],
+                    "version": active["version"],
+                    "description": active["description"],
+                    "body": "",
+                    "status": "refreshing",
+                    "allowed_commands": [],
+                    "cli_packages": [],
+                    "references": [],
+                    "local_path": str(skill_dir),
+                    "stale_index": True,
+                    "deployment_status": active.get("deployment_status"),
+                    "updated_at": active.get("updated_at"),
+                }
+            # Fall through: SKILL.md exists locally (stale), return it
+            # while the refresh completes in the background.
+            logger.info(
+                f"Returning stale content for skill '{name}' while refresh completes."
+            )
+        else:
+            # Launch the refresh in background
+            logger.info(
+                f"Local metadata stale or missing for skill '{name}' — "
+                f"launching background refresh from git."
+            )
+            launch_refresh(
+                logger=logger,
+                partition_key=partition_key,
+                skill_name=name,
+                active=active,
+                skill_root=str(skill_root),
+            )
+
+            # If SKILL.md doesn't exist yet (first-time load), return refreshing
+            if not (skill_dir / "SKILL.md").is_file():
+                return {
+                    "name": active["name"],
+                    "version": active["version"],
+                    "description": active["description"],
+                    "body": "",
+                    "status": "refreshing",
+                    "allowed_commands": [],
+                    "cli_packages": [],
+                    "references": [],
+                    "local_path": str(skill_dir),
+                    "stale_index": True,
+                    "deployment_status": active.get("deployment_status"),
+                    "updated_at": active.get("updated_at"),
+                }
+            # Fall through: return stale content while refresh runs
+            logger.info(
+                f"Returning stale content for skill '{name}' while background refresh completes."
+            )
 
     # ------------------------------------------------------------------
     # Validate SKILL.md and compute local checksum

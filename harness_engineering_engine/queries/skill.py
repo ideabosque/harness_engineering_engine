@@ -53,7 +53,14 @@ def resolve_skill_list(
 def resolve_search_skills(
     info: ResolveInfo, **kwargs: Dict[str, Any]
 ) -> SkillListType:
-    """Lexical search over name and description, ranked in Python for v1."""
+    """Fuzzy search over name and description, ranked in Python for v1.
+
+    Uses rapidfuzz token-set ratio for fuzzy matching against both name and
+    description. Exact name matches always rank first, followed by prefix
+    matches, then fuzzy matches sorted by composite score (name weighted 2×
+    over description). Falls back to the old lexical approach if rapidfuzz
+    is unavailable.
+    """
     query = kwargs.get("query", "").strip()
     if not query:
         return SkillListType(skill_list=[], total=0)
@@ -64,24 +71,62 @@ def resolve_search_skills(
     all_skills = get_repo("skill").list(info, enabled=True, limit=1000)
     items = all_skills.skill_list if hasattr(all_skills, "skill_list") else []
 
-    exact_matches = []
-    prefix_matches = []
-    description_matches = []
-
     query_lower = query.lower()
 
+    # ------------------------------------------------------------------
+    # Tier 1: exact name and prefix matches (highest priority)
+    # ------------------------------------------------------------------
+    exact_matches = []
+    prefix_matches = []
+    remaining = []
+
     for skill in items:
-        name = skill.name or ""
-        desc = skill.description or ""
-
-        if name.lower() == query_lower:
+        name = (skill.name or "").lower()
+        if name == query_lower:
             exact_matches.append(skill)
-        elif name.lower().startswith(query_lower):
+        elif name.startswith(query_lower):
             prefix_matches.append(skill)
-        elif query_lower in desc.lower():
-            description_matches.append(skill)
+        else:
+            remaining.append(skill)
 
-    ranked = exact_matches + prefix_matches + description_matches
-    ranked = ranked[:limit]
+    # ------------------------------------------------------------------
+    # Tier 2: fuzzy matches via rapidfuzz
+    # ------------------------------------------------------------------
+    fuzzy_matches = []
+    try:
+        from rapidfuzz import fuzz
+
+        for skill in remaining:
+            name = skill.name or ""
+            desc = skill.description or ""
+
+            # token_set_ratio handles word-order differences and partial
+            # token overlap well (e.g. "video slideshow" matches "slideshow
+            # video production"). Score is 0-100.
+            name_score = fuzz.token_set_ratio(query_lower, name.lower())
+            desc_score = fuzz.token_set_ratio(query_lower, desc.lower())
+
+            # Composite: name weighted 2× over description. A skill that
+            # matches only in description needs a decent score to surface.
+            composite = (name_score * 2 + desc_score) / 3
+
+            # Threshold: only include skills with at least some relevance.
+            # 40 is a lenient cutoff — token_set_ratio returns 0 for no
+            # token overlap at all, and ~50+ for partial matches.
+            if composite >= 40:
+                fuzzy_matches.append((composite, skill))
+
+        # Sort by composite score descending
+        fuzzy_matches.sort(key=lambda x: x[0], reverse=True)
+        fuzzy_skills = [s for _, s in fuzzy_matches]
+    except ImportError:
+        # Fallback: old lexical substring match
+        fuzzy_skills = [
+            skill
+            for skill in remaining
+            if query_lower in (skill.description or "").lower()
+        ]
+
+    ranked = (exact_matches + prefix_matches + fuzzy_skills)[:limit]
 
     return SkillListType(skill_list=ranked, total=len(ranked))

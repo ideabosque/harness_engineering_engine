@@ -31,6 +31,7 @@ dependencies = [
     "pendulum",
     "tenacity",
     "pyyaml",
+    "rapidfuzz",
     "SilvaEngine-DynamoDB-Base",
     "SilvaEngine-Utility",
     "silvaengine-constants",

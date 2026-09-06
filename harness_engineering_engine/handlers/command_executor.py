@@ -230,10 +230,17 @@ def execute_command(
         stdout = result.stdout
         stderr = result.stderr
 
-        if len(stdout.encode("utf-8")) > output_limit:
+        stdout_len = len(stdout.encode("utf-8"))
+        stderr_len = len(stderr.encode("utf-8"))
+        truncated = False
+        output_truncated_bytes = 0
+
+        if stdout_len > output_limit:
+            output_truncated_bytes += stdout_len - (output_limit // 2)
             stdout = stdout[: output_limit // 2]
             truncated = True
-        if len(stderr.encode("utf-8")) > output_limit:
+        if stderr_len > output_limit:
+            output_truncated_bytes += stderr_len - (output_limit // 2)
             stderr = stderr[: output_limit // 2]
             truncated = True
 
@@ -243,6 +250,7 @@ def execute_command(
             "exit_code": result.returncode,
             "timed_out": timed_out,
             "truncated": truncated,
+            "output_truncated_bytes": output_truncated_bytes,
         }
 
     except subprocess.TimeoutExpired:

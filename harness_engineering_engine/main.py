@@ -32,6 +32,7 @@ def deploy() -> List:
                         {"action": "skill", "label": "Get Skill"},
                         {"action": "cliPackages", "label": "CLI Package Catalog"},
                         {"action": "cliPackage", "label": "Get CLI Package"},
+                        {"action": "pollCommand", "label": "Poll Async Command"},
                     ],
                     "mutation": [
                         {"action": "insertUpdateSkill", "label": "Insert Update Skill"},

@@ -220,13 +220,23 @@ class TestOnDemandRefresh:
         meta["resolved_commit"] = "0" * 40
         meta_file.write_text(json.dumps(meta))
 
+        # skill(name) now launches a background refresh instead of blocking.
+        # The stale content is returned immediately (SKILL.md exists locally),
+        # and the metadata file is updated once the background thread completes.
         second = _gql(
             'query { skill(name: "refresh-skill") { body localContentChecksum staleIndex } }',
             itest,
         )["skill"]
         assert second["body"] == "Fresh body from git."
-        assert second["staleIndex"] is False
-        refreshed_meta = json.loads(meta_file.read_text())
+
+        # Wait for the background refresh to complete (max ~10s)
+        import time as _time
+        for _ in range(100):
+            refreshed_meta = json.loads(meta_file.read_text())
+            if refreshed_meta["resolved_commit"] != "0" * 40:
+                break
+            _time.sleep(0.1)
+
         assert refreshed_meta["resolved_commit"] != "0" * 40
 
 

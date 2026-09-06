@@ -37,6 +37,11 @@ class SkillType(ObjectType):
     updated_by = String()
     updated_at = DateTime()
 
+    # Populated only when a background git refresh is in progress and
+    # the local cache is not yet available. "refreshing" tells the caller
+    # to retry after a short wait. Absent in the normal (content ready) case.
+    status = String()
+
     # Populated only by the agent-facing skill(name) read path
     # (handlers.skill_reader.skill), not by plain DB row lookups.
     body = String()

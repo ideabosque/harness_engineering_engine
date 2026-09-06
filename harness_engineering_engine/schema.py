@@ -26,8 +26,10 @@ from .mutations.skill_management import (
     RunCommand,
 )
 from .queries.cli_package import resolve_cli_package, resolve_cli_package_list
+from .queries.poll_command import resolve_poll_command
 from .queries.skill import resolve_search_skills, resolve_skill, resolve_skill_list
 from .types.cli_package import CliPackageListType, CliPackageType
+from .types.poll_command import PollCommandType
 from .types.skill import SkillListType, SkillType
 
 
@@ -37,6 +39,7 @@ def type_class():
         SkillListType,
         CliPackageType,
         CliPackageListType,
+        PollCommandType,
     ]
 
 
@@ -83,6 +86,12 @@ class Query(ObjectType):
         cli_package_uuid=String(required=False),
     )
 
+    # Agent-facing async command polling
+    poll_command = Field(
+        PollCommandType,
+        run_id=String(name="run_id", required=True),
+    )
+
     def resolve_ping(self, info: ResolveInfo) -> str:
         return f"Hello at {time.strftime('%X')}!!"
 
@@ -110,6 +119,11 @@ class Query(ObjectType):
         self, info: ResolveInfo, **kwargs: Dict[str, Any]
     ) -> CliPackageType | None:
         return resolve_cli_package(info, **kwargs)
+
+    def resolve_poll_command(
+        self, info: ResolveInfo, **kwargs: Dict[str, Any]
+    ) -> PollCommandType | None:
+        return resolve_poll_command(info, **kwargs)
 
 
 class Mutations(ObjectType):

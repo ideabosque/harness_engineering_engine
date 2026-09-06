@@ -1266,3 +1266,48 @@ Proceed with the simplified plan, but make the v1 contract stricter:
 Items 1-4 and 7-8 are implemented (see the Implementation status table at the top of this document; items 1 and 2 required the Known-issues fixes above). The remaining gap before wider rollout is test coverage, not architecture: close the path-traversal/timeout/output-cap tests on the command executor and add coverage for deployment, refresh, registration, retrieval, auth/tenant, and MCP integration per §15, and confirm item 5 (auth/tenant rules) against the actual resolver code rather than assuming it from the schema shape.
 
 This keeps the project lightweight while addressing the risks that would otherwise make the simplified architecture fragile in production.
+
+---
+
+## 18. Integration gaps — on-demand skill load + command execution (2026-09-06)
+
+Identified during an end-to-end review of the `mcp_skill_provider → harness_engineering_engine` workflow (agent loads a skill on demand, then executes its CLI scripts). These gaps sit at the seam between the two projects and affect the reliability of the `search_skills → get_skill → run_command` path.
+
+### G-1 (Blocker) — Long-running commands hard-kill at 30s, no async/poll path
+
+`handlers/command_executor.py::execute_command` uses `subprocess.run(..., timeout=RUN_COMMAND_DEFAULT_TIMEOUT_SECONDS)` (default 30s). When the timeout fires, the process is killed and the result is `{stdout:"", stderr:"Command timed out...", timed_out:true}` — no partial output, no run handle, no way for the caller to resume or poll.
+
+Unlike `mcp_daemon_engine`, which has an `EmbeddedResource` polling pattern for async tools, `runCommand` is purely synchronous with a hard ceiling. Any skill script that legitimately takes more than ~30s (video rendering, data processing, large file operations) silently fails.
+
+**Plan:** Add a `background_mode` to `runCommand` that launches the process, stores a handle keyed by `run_id`, and returns the `run_id` so the MCP caller can poll status via a new `pollCommand(run_id)` query. The process runs detached with output captured to a temp file; `pollCommand` returns `{status, stdout_so_far, exit_code, timed_out}`. This mirrors the async-tool pattern already proven in `mcp_daemon_engine`.
+
+### G-2 (Blocker) — GraphQL 60s timeout races with git-refresh + command execution
+
+`mcp_skill_provider`'s `GraphQLClient.execute_query` (`graphql_client.py:249`) uses `httpx.Timeout(60.0, connect=15.0)`. The `runCommand` mutation path first calls `skill()` (via `command_executor._get_skill`), which triggers a **git clone** on a cache miss (`skill_reader._download_and_install → skill_refresh.refresh_single_skill`). If the git remote is slow, the skill load alone can consume most of the 60s budget, leaving the actual command execution to race the deadline.
+
+A first-time skill load with a slow remote can cause `run_command` to fail at the GraphQL/HTTP layer before the command starts — and the error surfaces as a generic GraphQL timeout, not a "still loading skill" message.
+
+**Resolved (2026-09-06):**
+- (a) `skill_reader.skill()` now launches the git refresh in a background thread (`skill_refresh_tracker.py`) instead of blocking. If `SKILL.md` exists locally (stale), it returns the stale content immediately. If the local cache is empty (first-time load), it returns `status: "refreshing"` with an empty body so the caller can retry after the refresh completes.
+- (b) `mcp_skill_provider`'s `GraphQLClient.execute_query` now uses a configurable timeout for mutations (`command_timeout_seconds`, default 120s) via the module setting.
+- (c) `mcp_skill_provider`'s `get_skill` mixin surfaces the `refreshing` status as a clear error message telling the LLM to retry.
+
+### G-3 (Should fix) — `searchSkills` ranking is naive (lexical, client-side, capped at 1000)
+
+`queries/skill.py::resolve_search_skills` fetched up to 1000 enabled skills and ranked in Python with exact → prefix → description-substring matching. No fuzzy search, no semantic search, no relevance scoring, no TF-IDF. `Embedding search` is already listed under §16 Defer, but the current lexical ranking missed relevant skills when the query didn't share substrings with the skill name/description.
+
+This was the LLM's entry point — if `search_skills` can't find the right skill, nothing downstream runs.
+
+**Resolved (2026-09-06):** Added `rapidfuzz.token_set_ratio`-based fuzzy ranking. Exact and prefix matches still rank first (tier 1); remaining skills are scored by composite (name weighted 2× over description, threshold 40/100) and sorted by score descending (tier 2). Falls back to lexical substring match if `rapidfuzz` is unavailable. `rapidfuzz` added to `pyproject.toml` dependencies.
+
+### G-4 (Should fix) — Output truncation doesn't indicate volume dropped
+
+`command_executor` truncated stdout/stderr at `output_limit_bytes` (default 20KB, `stdout[:limit//2]`) and set `truncated=true`. The LLM got half the output and a boolean, with no indication of how much was dropped or where the cut happened.
+
+**Resolved (2026-09-06):** Both the synchronous (`command_executor.py`) and async (`async_command_executor.py`) paths now compute and return `output_truncated_bytes` — the total number of bytes dropped across stdout + stderr. The `RunCommand` GraphQL type and `PollCommandType` both expose this field.
+
+### G-5 (Nice to have) — No streaming of command output
+
+`run_command` was fully synchronous: run → capture all output → return. There was no streaming path, so the LLM couldn't see partial progress from long-running scripts.
+
+**Resolved (2026-09-06):** The async `pollCommand` query returns `stdout_so_far` incrementally — the LLM can poll while the command runs and see partial output as it arrives. No separate streaming mechanism needed.

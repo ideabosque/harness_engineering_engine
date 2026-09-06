@@ -7,7 +7,7 @@ __author__ = "bibow"
 import traceback
 from typing import Any, Dict
 
-from graphene import Argument, Boolean, Field, List, Mutation, String
+from graphene import Argument, Boolean, Field, Int, List, Mutation, String
 from silvaengine_utility import JSONCamelCase
 
 from ..handlers import skill_version_cache
@@ -331,37 +331,200 @@ class RunCommand(Mutation):
     This mutation is the bridge between the MCP-side ``run_command`` tool and
     the guarded command executor service.  It validates the allowlist, then
     executes the command via the executor.
+
+    When ``background`` is True, the command is launched detached in a
+    background thread and a ``run_id`` is returned immediately.  The caller
+    polls status via the ``pollCommand(run_id)`` query.  This is the async
+    path for long-running scripts that would otherwise exceed the 30s
+    synchronous timeout.
     """
 
     class Arguments:
         name = String(required=True)
         argv = Argument(List(String), required=True)
         workspace_scope = String(required=False)
+        background = Boolean(required=False)
 
     stdout = String()
     stderr = String()
     exit_code = String()
     timed_out = Boolean()
     truncated = Boolean()
+    output_truncated_bytes = Int()
+    run_id = String()
 
     @staticmethod
     def mutate(root: Any, info: Any, **kwargs: Dict[str, Any]) -> "RunCommand":
         try:
-            from ..handlers.command_executor import execute_command
+            background = kwargs.get("background", False)
 
-            result = execute_command(
-                info,
-                skill_name=kwargs["name"],
-                argv=kwargs["argv"],
-                workspace_scope=kwargs.get("workspace_scope"),
-            )
-            return RunCommand(
-                stdout=result["stdout"],
-                stderr=result["stderr"],
-                exit_code=str(result["exit_code"]),
-                timed_out=result["timed_out"],
-                truncated=result["truncated"],
-            )
+            if background:
+                return RunCommand._run_background(info, **kwargs)
+            else:
+                from ..handlers.command_executor import execute_command
+
+                result = execute_command(
+                    info,
+                    skill_name=kwargs["name"],
+                    argv=kwargs["argv"],
+                    workspace_scope=kwargs.get("workspace_scope"),
+                )
+                return RunCommand(
+                    stdout=result["stdout"],
+                    stderr=result["stderr"],
+                    exit_code=str(result["exit_code"]),
+                    timed_out=result["timed_out"],
+                    truncated=result["truncated"],
+                    output_truncated_bytes=result.get("output_truncated_bytes", 0),
+                )
         except Exception as e:
             info.context.get("logger").error(traceback.format_exc())
             raise e
+
+    @staticmethod
+    def _run_background(info: Any, **kwargs: Dict[str, Any]) -> "RunCommand":
+        """Launch a command in background mode and return a run_id handle.
+
+        Reuses the synchronous executor's validation (kill switch, allowlist
+        match, shell-metacharacter rejection, CLI package ensure) but launches
+        the actual subprocess detached instead of blocking on it.
+        """
+        import os
+        import shlex
+
+        from ..handlers.async_command_executor import launch_background_command
+        from ..handlers.command_executor import (
+            _normalize_argv,
+            _match_allowed_command,
+            _resolve_and_validate_paths,
+        )
+        from ..handlers.config import Config
+        from ..handlers.skill_path import resolve_skill_root
+        from ..handlers.skill_reader import skill as _get_skill
+
+        logger = info.context.get("logger") or __import__("logging").getLogger(__name__)
+
+        # ------------------------------------------------------------------
+        # Kill switch
+        # ------------------------------------------------------------------
+        if not Config.RUN_COMMAND_ENABLED:
+            raise RuntimeError(
+                "HSK_RUN_COMMAND_ENABLED is false — command execution is disabled."
+            )
+
+        # ------------------------------------------------------------------
+        # Resolve skill allowlist (same as synchronous path)
+        # ------------------------------------------------------------------
+        skill_data = _get_skill(info, name=kwargs["name"])
+        allowed = skill_data.get("allowed_commands", [])
+
+        if not allowed:
+            raise PermissionError(
+                f"Skill '{kwargs['name']}' has no allowed_commands — command denied."
+            )
+
+        # ------------------------------------------------------------------
+        # Ensure CLI packages are installed (same as synchronous path)
+        # ------------------------------------------------------------------
+        cli_packages = skill_data.get("cli_packages", [])
+        if cli_packages:
+            from ..handlers.cli_package_manager import ensure_package
+
+            for pkg in cli_packages:
+                pkg_name = pkg.get("package_name") or pkg.get("distribution_name")
+                if not pkg_name:
+                    continue
+                result = ensure_package(info, pkg_name)
+                if result.get("status") != "ready":
+                    error = result.get("error", "unknown error")
+                    raise RuntimeError(
+                        f"CLI package '{pkg_name}' is not ready: {error}"
+                    )
+
+        # ------------------------------------------------------------------
+        # Normalize argv
+        # ------------------------------------------------------------------
+        argv_list = _normalize_argv(kwargs["argv"])
+
+        # ------------------------------------------------------------------
+        # Reject shell constructs
+        # ------------------------------------------------------------------
+        for arg in argv_list:
+            if any(c in arg for c in ("|", "&", ";", ">", "<", "`", "$(")):
+                raise PermissionError(f"Shell metacharacters rejected: {arg}")
+
+        # ------------------------------------------------------------------
+        # Allowlist match
+        # ------------------------------------------------------------------
+        matched = _match_allowed_command(argv_list, allowed)
+        if matched is None:
+            raise PermissionError(
+                f"Command argv {argv_list!r} does not match any allowed_commands "
+                f"entry for skill '{kwargs['name']}'."
+            )
+
+        # ------------------------------------------------------------------
+        # Resolve paths and working directory
+        # ------------------------------------------------------------------
+        skill_root = resolve_skill_root()
+        skill_dir = skill_root / kwargs["name"]
+        argv_list = _resolve_and_validate_paths(
+            argv_list, skill_dir, kwargs.get("workspace_scope")
+        )
+
+        # ------------------------------------------------------------------
+        # Timeout / output limits
+        # ------------------------------------------------------------------
+        timeout_seconds = int(
+            matched.get("timeout_seconds", Config.RUN_COMMAND_DEFAULT_TIMEOUT_SECONDS)
+        )
+        # Background commands get a larger default timeout since they don't
+        # block the caller. Use 10x the synchronous default if not explicitly
+        # set in the allowlist entry.
+        if "timeout_seconds" not in matched:
+            timeout_seconds = max(timeout_seconds * 10, 300)
+
+        output_limit = int(
+            matched.get("output_limit_bytes", Config.RUN_COMMAND_OUTPUT_LIMIT_BYTES)
+        )
+
+        # ------------------------------------------------------------------
+        # Dry-run
+        # ------------------------------------------------------------------
+        if Config.DRY_RUN:
+            logger.info(f"DRY-RUN (background): skill={kwargs['name']} argv={argv_list!r}")
+            return RunCommand(
+                run_id="dry-run",
+                stdout=f"DRY-RUN: {' '.join(argv_list)}",
+                stderr="",
+                exit_code="0",
+                timed_out=False,
+                truncated=False,
+            )
+
+        # ------------------------------------------------------------------
+        # Launch
+        # ------------------------------------------------------------------
+        partition_key = info.context.get("partition_key")
+        logger.info(
+            f"Launching background command: skill={kwargs['name']} argv={argv_list!r} "
+            f"timeout={timeout_seconds} output_limit={output_limit} tenant={partition_key}"
+        )
+
+        result = launch_background_command(
+            logger=logger,
+            skill_name=kwargs["name"],
+            argv=argv_list,
+            cwd=str(skill_dir),
+            timeout_seconds=timeout_seconds,
+            output_limit=output_limit,
+        )
+
+        return RunCommand(
+            run_id=result["run_id"],
+            stdout="",
+            stderr="",
+            exit_code=None,
+            timed_out=False,
+            truncated=False,
+        )
