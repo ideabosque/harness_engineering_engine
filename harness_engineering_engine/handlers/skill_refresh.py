@@ -15,11 +15,12 @@ import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from . import git_client
 from .checksums import compute_content_checksum
 from .config import Config
+from .reference_pull import pull_reference_files
 from .skill_frontmatter import parse_skill_file
 from .skill_path import resolve_skill_root
 
@@ -82,10 +83,27 @@ def refresh_single_skill(
     clone_dir = git_client.clone_at_commit(git_repository_url, git_ref, resolved_commit)
     try:
         skill_content_dir = _resolve_skill_content_dir(clone_dir, skill_name)
-        parse_skill_file(skill_content_dir / "SKILL.md")
+        parsed = parse_skill_file(skill_content_dir / "SKILL.md")
+
+        # Mirror deploy_skill_package's handling of declared reference_files
+        # that live elsewhere in this same repo clone (e.g. shared
+        # config/docs, or a CLI dependency's own source, at the repo root)
+        # — pull them in here too, before checksumming, so a refresh on a
+        # different host reproduces the same on-disk layout and the same
+        # checksum. Generation-only (undeclared) reference_files aren't
+        # reproducible from a plain refresh — same boundary as the
+        # generated-sections sidecar, which is already deploy-host-local
+        # and never carried by refresh either.
+        pulled_excluded: Set[str] = set()
+        if "reference_files" in parsed.raw_frontmatter:
+            _, pulled_excluded = pull_reference_files(
+                logger, clone_dir, skill_content_dir, parsed.frontmatter.reference_files
+            )
 
         content_checksum = compute_content_checksum(
-            skill_content_dir, Config.SKILL_LOCAL_METADATA_FILE
+            skill_content_dir,
+            Config.SKILL_LOCAL_METADATA_FILE,
+            excluded_relpaths=pulled_excluded,
         )
         if content_checksum != active.get("content_checksum"):
             raise ValueError(

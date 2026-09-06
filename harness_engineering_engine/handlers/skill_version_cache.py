@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .checksums import GENERATED_SIDECAR_FILENAME
+from .checksums import CHECKSUM_EXCLUSIONS_FILENAME, GENERATED_SIDECAR_FILENAME
 from .config import Config
 
 
@@ -55,14 +55,19 @@ def install_from_cache(skill_root: Path, name: str, version: str) -> bool:
         shutil.rmtree(swap)
     shutil.copytree(src, swap, ignore=_ignore_hidden)
 
-    # The generated-sections sidecar (P9) is a dotfile, so the copytree
-    # above already dropped it via _ignore_hidden — the same filter that
-    # correctly excludes .git from the git-sourced content. Carry it over
-    # explicitly here, the same way write_local_metadata is a separate
-    # write rather than part of that copy.
+    # The generated-sections sidecar (P9) and the checksum-exclusions
+    # sidecar are both dotfiles, so the copytree above already dropped
+    # them via _ignore_hidden — the same filter that correctly excludes
+    # .git from the git-sourced content. Carry them over explicitly here,
+    # the same way write_local_metadata is a separate write rather than
+    # part of that copy.
     generated_src = src / GENERATED_SIDECAR_FILENAME
     if generated_src.is_file():
         shutil.copy2(generated_src, swap / GENERATED_SIDECAR_FILENAME)
+
+    exclusions_src = src / CHECKSUM_EXCLUSIONS_FILENAME
+    if exclusions_src.is_file():
+        shutil.copy2(exclusions_src, swap / CHECKSUM_EXCLUSIONS_FILENAME)
 
     if dest.exists():
         shutil.rmtree(dest)
@@ -142,6 +147,50 @@ def read_generated_sidecar(skill_dir: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+def write_checksum_exclusions(
+    skill_root: Path,
+    name: str,
+    version: str,
+    resolved_commit: Optional[str],
+    excluded_relpaths: List[str],
+) -> None:
+    """Record, into this version's cache directory, which reference_files
+    paths were pulled in from elsewhere in the repo (see
+    ``reference_pull.pull_reference_files``) and so must be excluded from
+    this skill's content checksum.
+
+    Deliberately a separate file from ``write_generated_sidecar``: that
+    one is what got generated *for* the skill (human/agent-facing);
+    this one is pure internal bookkeeping ``skill()``'s own read-time
+    checksum recomputation needs, nothing a skill author or agent needs
+    to see. Writes nothing when ``excluded_relpaths`` is empty — most
+    skills pull in nothing at all.
+    """
+    if not excluded_relpaths:
+        return
+    dest = version_cache_dir(skill_root, name, version)
+    dest.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "resolved_commit": resolved_commit,
+        "excluded_relpaths": sorted(excluded_relpaths),
+    }
+    with open(dest / CHECKSUM_EXCLUSIONS_FILENAME, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+
+
+def read_checksum_exclusions(skill_dir: Path) -> Optional[Dict[str, Any]]:
+    """Read the checksum-exclusions sidecar from an installed skill
+    directory, if present."""
+    path = skill_dir / CHECKSUM_EXCLUSIONS_FILENAME
+    if not path.is_file():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 __all__ = [
     "version_cache_dir",
     "store_version",
@@ -150,4 +199,6 @@ __all__ = [
     "write_local_metadata",
     "write_generated_sidecar",
     "read_generated_sidecar",
+    "write_checksum_exclusions",
+    "read_checksum_exclusions",
 ]

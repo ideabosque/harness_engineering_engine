@@ -19,12 +19,13 @@ import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from ..models.repositories import get_repo
 from . import git_client, skill_version_cache
 from .checksums import compute_content_checksum
 from .config import Config
+from .reference_pull import pull_reference_files
 from .section_generator import generate_missing_sections
 from .skill_frontmatter import parse_skill_file
 from .skill_path import resolve_skill_root
@@ -57,15 +58,35 @@ def _validate_skill_dir(skill_dir: Path) -> Dict[str, Any]:
     }
 
 
+# Folder names (case-insensitive) whose contents must never be proposed
+# as reference_files — none of this is documentation/config material a
+# skill needs a copy of.
+_EXCLUDED_FOLDER_NAMES = {"docs", "tests"}
+
+
+def _is_under_excluded_folder(rel_parts: tuple) -> bool:
+    """True if any directory component matches one of
+    ``_EXCLUDED_FOLDER_NAMES`` (case-insensitive)."""
+    return any(part.lower() in _EXCLUDED_FOLDER_NAMES for part in rel_parts[:-1])
+
+
+def _is_readme(rel_parts: tuple) -> bool:
+    """True if the filename component is ``README.md`` (case-insensitive)."""
+    return bool(rel_parts) and rel_parts[-1].lower() == "readme.md"
+
+
 def _list_available_files(skill_dir: Path) -> List[str]:
     """Sorted relative paths of every non-hidden file under ``skill_dir``,
-    excluding ``SKILL.md`` itself.
+    excluding ``SKILL.md``/``README.md`` and anything under a ``docs`` or
+    ``tests`` folder.
 
     Used to ground P9's ``reference_files`` generation in files that
     actually exist — never an invented path. ``SKILL.md`` is excluded so
     it's never even a candidate: its content is already returned via
     ``body`` on every read, so including it again in ``references`` would
-    just be duplication.
+    just be duplication. ``README.md``/``docs``/``tests`` are excluded
+    the same way — none of that is reference material a skill needs a
+    copy of.
     """
     files: List[str] = []
     for path in sorted(skill_dir.rglob("*")):
@@ -74,8 +95,49 @@ def _list_available_files(skill_dir: Path) -> List[str]:
         rel = path.relative_to(skill_dir)
         if any(part.startswith(".") for part in rel.parts):
             continue
+        if _is_under_excluded_folder(rel.parts) or _is_readme(rel.parts):
+            continue
         rel_str = str(rel).replace("\\", "/")
         if rel_str == "SKILL.md":
+            continue
+        files.append(rel_str)
+    return files
+
+
+def _is_relative_to(path: Path, other: Path) -> bool:
+    try:
+        path.relative_to(other)
+        return True
+    except ValueError:
+        return False
+
+
+def _list_repo_wide_files(content_root: Path, skill_dir_set: Set[Path]) -> List[str]:
+    """Repo-root-relative paths of every non-hidden file in the whole
+    cloned repository, excluding every discovered skill's own directory
+    (so one skill's ``reference_files`` generation is never handed
+    another skill's internal files as a candidate), every ``SKILL.md``/
+    ``README.md``, and anything under a ``docs`` or ``tests`` folder.
+
+    Widens ``reference_files`` generation candidates beyond a skill's own
+    directory for monorepos that keep shared reference material (config,
+    and even a CLI dependency's own source) at the repository root rather
+    than duplicated into every skill's own folder — a real, common shape,
+    not something to force every skill author to restructure around.
+    """
+    files: List[str] = []
+    for path in sorted(content_root.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(content_root)
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+        if any(_is_relative_to(path.resolve(), d) for d in skill_dir_set):
+            continue
+        if _is_under_excluded_folder(rel.parts) or _is_readme(rel.parts):
+            continue
+        rel_str = str(rel).replace("\\", "/")
+        if rel_str == "SKILL.md" or rel_str.endswith("/SKILL.md"):
             continue
         files.append(rel_str)
     return files
@@ -200,6 +262,7 @@ def deploy_skill_package(
         )
         if not skill_dirs:
             raise ValueError(f"No SKILL.md found in git git_repository_url '{git_repository_url}'.")
+        skill_dir_set = {p.parent.resolve() for p in skill_dirs}
 
         for skill_md in skill_dirs:
             skill_git_repository_url_dir = skill_md.parent
@@ -217,10 +280,6 @@ def deploy_skill_package(
                 # with a dependency that doesn't actually work yet.
                 _ensure_cli_packages(
                     info, validation["cli_packages"], updated_by="system"
-                )
-
-                content_checksum = compute_content_checksum(
-                    skill_git_repository_url_dir, Config.SKILL_LOCAL_METADATA_FILE
                 )
 
                 # P9: propose values for whichever of allowed_commands/
@@ -241,15 +300,56 @@ def deploy_skill_package(
                 }
                 generated_sections: Dict[str, Any] = {}
                 if missing_fields:
+                    candidate_files = _list_available_files(skill_git_repository_url_dir)
+                    if "reference_files" in missing_fields:
+                        candidate_files = sorted(
+                            set(candidate_files)
+                            | set(_list_repo_wide_files(content_root, skill_dir_set))
+                        )
                     generated_sections = generate_missing_sections(
                         logger,
                         resolved_name,
                         validation["description"],
                         validation["body"],
                         validation["cli_packages"],
-                        _list_available_files(skill_git_repository_url_dir),
+                        candidate_files,
                         missing_fields,
                     )
+
+                # Whichever reference_files this skill ends up with — the
+                # author's own declared list, or what generation just
+                # proposed — may name a path that lives elsewhere in this
+                # same repository clone (e.g. shared config/docs, or a
+                # CLI dependency's own source, at the repo root) rather
+                # than inside this skill's own directory. Pull those in
+                # now, before checksumming, so skill()'s read path (which
+                # only ever looks inside the installed skill directory)
+                # finds them with no knowledge of the wider repo layout.
+                # Files pulled in from elsewhere are excluded from the
+                # checksum below — they're a copy of material this skill
+                # doesn't itself author.
+                reference_files_declared = "reference_files" in validation["declared_fields"]
+                reference_files_to_pull = (
+                    validation["reference_files"]
+                    if reference_files_declared
+                    else generated_sections.get("reference_files", [])
+                )
+                pulled_excluded: Set[str] = set()
+                if reference_files_to_pull:
+                    resolved_refs, pulled_excluded = pull_reference_files(
+                        logger,
+                        content_root,
+                        skill_git_repository_url_dir,
+                        reference_files_to_pull,
+                    )
+                    if not reference_files_declared:
+                        generated_sections["reference_files"] = resolved_refs
+
+                content_checksum = compute_content_checksum(
+                    skill_git_repository_url_dir,
+                    Config.SKILL_LOCAL_METADATA_FILE,
+                    excluded_relpaths=pulled_excluded,
+                )
 
                 # Register in database. A skill's first-ever version is
                 # activated automatically so it is immediately retrievable;
@@ -298,6 +398,13 @@ def deploy_skill_package(
                         resolved_commit,
                         generated_sections,
                     )
+                skill_version_cache.write_checksum_exclusions(
+                    skill_root,
+                    resolved_name,
+                    resolved_version,
+                    resolved_commit,
+                    sorted(pulled_excluded),
+                )
                 if activate:
                     skill_version_cache.install_from_cache(
                         skill_root, resolved_name, resolved_version

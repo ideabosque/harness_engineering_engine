@@ -11,7 +11,10 @@ write rather than part of that copy.
 from __future__ import print_function
 
 from harness_engineering_engine.handlers import skill_version_cache
-from harness_engineering_engine.handlers.checksums import GENERATED_SIDECAR_FILENAME
+from harness_engineering_engine.handlers.checksums import (
+    CHECKSUM_EXCLUSIONS_FILENAME,
+    GENERATED_SIDECAR_FILENAME,
+)
 
 
 class TestGeneratedSidecar:
@@ -94,3 +97,76 @@ class TestGeneratedSidecar:
 
         assert installed is True
         assert not (skill_root / "my-skill" / GENERATED_SIDECAR_FILENAME).exists()
+
+
+class TestChecksumExclusions:
+    """Bookkeeping for which reference_files paths were pulled in from
+    elsewhere in the repo, and so must be excluded from this skill's
+    content checksum — kept in its own sidecar, separate from the
+    human/agent-facing generated-sections one."""
+
+    def test_write_and_read_roundtrip(self, tmp_path):
+        skill_root = tmp_path / "skill_root"
+        skill_root.mkdir()
+        cache_dir = skill_version_cache.version_cache_dir(skill_root, "my-skill", "1.0")
+        cache_dir.mkdir(parents=True)
+
+        skill_version_cache.write_checksum_exclusions(
+            skill_root, "my-skill", "1.0", "abc123", ["config/shared.yaml"]
+        )
+
+        loaded = skill_version_cache.read_checksum_exclusions(cache_dir)
+        assert loaded["resolved_commit"] == "abc123"
+        assert loaded["excluded_relpaths"] == ["config/shared.yaml"]
+
+    def test_empty_excluded_relpaths_writes_nothing(self, tmp_path):
+        skill_root = tmp_path / "skill_root"
+        skill_root.mkdir()
+        cache_dir = skill_version_cache.version_cache_dir(skill_root, "my-skill", "1.0")
+        cache_dir.mkdir(parents=True)
+
+        skill_version_cache.write_checksum_exclusions(
+            skill_root, "my-skill", "1.0", "abc123", []
+        )
+
+        assert not (cache_dir / CHECKSUM_EXCLUSIONS_FILENAME).exists()
+
+    def test_read_missing_returns_none(self, tmp_path):
+        assert skill_version_cache.read_checksum_exclusions(tmp_path) is None
+
+    def test_read_corrupted_returns_none(self, tmp_path):
+        (tmp_path / CHECKSUM_EXCLUSIONS_FILENAME).write_text("not valid json {{{")
+        assert skill_version_cache.read_checksum_exclusions(tmp_path) is None
+
+    def test_install_from_cache_carries_it_across(self, tmp_path):
+        skill_root = tmp_path / "skill_root"
+        skill_root.mkdir()
+
+        content_dir = tmp_path / "content"
+        content_dir.mkdir()
+        (content_dir / "SKILL.md").write_text("---\nname: my-skill\n---\n\nBody.\n")
+
+        skill_version_cache.store_version(skill_root, "my-skill", "1.0", content_dir)
+        skill_version_cache.write_checksum_exclusions(
+            skill_root, "my-skill", "1.0", "abc123", ["config/shared.yaml"]
+        )
+
+        installed = skill_version_cache.install_from_cache(skill_root, "my-skill", "1.0")
+
+        assert installed is True
+        loaded = skill_version_cache.read_checksum_exclusions(skill_root / "my-skill")
+        assert loaded["excluded_relpaths"] == ["config/shared.yaml"]
+
+    def test_install_from_cache_without_exclusions_is_unaffected(self, tmp_path):
+        skill_root = tmp_path / "skill_root"
+        skill_root.mkdir()
+
+        content_dir = tmp_path / "content"
+        content_dir.mkdir()
+        (content_dir / "SKILL.md").write_text("---\nname: my-skill\n---\n\nBody.\n")
+
+        skill_version_cache.store_version(skill_root, "my-skill", "1.0", content_dir)
+        installed = skill_version_cache.install_from_cache(skill_root, "my-skill", "1.0")
+
+        assert installed is True
+        assert not (skill_root / "my-skill" / CHECKSUM_EXCLUSIONS_FILENAME).exists()

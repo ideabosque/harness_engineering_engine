@@ -553,6 +553,225 @@ class TestDeploySkillPackageSectionGeneration:
         assert not sidecar.exists()
 
 
+class TestDeploySkillPackageReferenceFilePull:
+    """P9 extension: reference_files may name a path that lives elsewhere
+    in the same repo clone (e.g. shared config/docs at a monorepo's root,
+    or a CLI dependency's own source) rather than inside the skill's own
+    folder — deploy must pull it in so the read path, which only ever
+    looks inside the installed skill directory, finds it."""
+
+    def _patch_skill_root(self, tmp_path):
+        skill_root = tmp_path / "skill_root"
+        skill_root.mkdir()
+        return patch(
+            "harness_engineering_engine.handlers.skill_deployment.resolve_skill_root",
+            return_value=skill_root,
+        ), skill_root
+
+    def _make_repo_with_root_level_config(self, tmp_path, name="rfq-assistant"):
+        remote = tmp_path / "remote"
+        remote.mkdir()
+        _run(["git", "init", "-q"], cwd=remote)
+        _run(["git", "symbolic-ref", "HEAD", "refs/heads/main"], cwd=remote)
+
+        (remote / "config").mkdir()
+        (remote / "config" / "shared.yaml").write_text("shared: true\n")
+
+        skill_dir = remote / name
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: Test skill.\n"
+            'allowed_commands: []\nreference_files:\n  - "config/shared.yaml"\n'
+            "---\n\nBody references `config/shared.yaml`.\n"
+        )
+
+        _run(["git", "add", "-A"], cwd=remote)
+        _run(
+            [
+                "git", "-c", "user.email=test@example.com", "-c", "user.name=test",
+                "commit", "-q", "-m", "init",
+            ],
+            cwd=remote,
+        )
+        return remote
+
+    def test_declared_reference_file_at_repo_root_is_pulled_into_skill_dir(self, tmp_path):
+        remote = self._make_repo_with_root_level_config(tmp_path)
+        root_patch, skill_root = self._patch_skill_root(tmp_path)
+
+        with root_patch:
+            with patch(
+                "harness_engineering_engine.handlers.skill_deployment.get_repo"
+            ) as mock_get_repo:
+                fake_repo = MagicMock()
+                fake_repo.list.return_value = FakeSkillListResult([])
+                mock_get_repo.return_value = fake_repo
+
+                result = deploy_skill_package(
+                    FakeInfo(), git_repository_url=str(remote), git_ref="main"
+                )
+
+        assert result["failed"] == []
+        pulled = skill_root / "rfq-assistant" / "config" / "shared.yaml"
+        assert pulled.is_file()
+        assert pulled.read_text() == "shared: true\n"
+
+    def test_pulled_reference_files_recorded_in_checksum_exclusions_sidecar(self, tmp_path):
+        """skill()'s own read-time checksum recomputation needs to know
+        which reference_files entries were pulled in from elsewhere (so it
+        can exclude them too, matching how the registered checksum was
+        computed) — this must be recorded even when reference_files is
+        fully declared and no other field needed generation at all. Kept
+        in its own sidecar, separate from the human/agent-facing
+        .hsk-generated.json — this is pure internal bookkeeping."""
+        remote = self._make_repo_with_root_level_config(tmp_path)
+        root_patch, skill_root = self._patch_skill_root(tmp_path)
+
+        with root_patch:
+            with patch(
+                "harness_engineering_engine.handlers.skill_deployment.get_repo"
+            ) as mock_get_repo:
+                fake_repo = MagicMock()
+                fake_repo.list.return_value = FakeSkillListResult([])
+                mock_get_repo.return_value = fake_repo
+
+                result = deploy_skill_package(
+                    FakeInfo(), git_repository_url=str(remote), git_ref="main"
+                )
+
+        assert result["failed"] == []
+
+        import json as _json
+
+        generated_sidecar = skill_root / "rfq-assistant" / ".hsk-generated.json"
+        if generated_sidecar.exists():
+            assert "pulled_reference_files" not in _json.loads(generated_sidecar.read_text())
+
+        exclusions_sidecar = skill_root / "rfq-assistant" / ".hsk-checksum-exclusions.json"
+        exclusions_data = _json.loads(exclusions_sidecar.read_text())
+        assert exclusions_data["excluded_relpaths"] == ["config/shared.yaml"]
+
+    def test_generation_candidates_widened_with_repo_wide_files(self, tmp_path):
+        """When reference_files is absent, generation must be offered
+        candidates from the whole repo clone, not just the skill's own
+        directory — otherwise a monorepo's shared root-level config/docs
+        can never be proposed."""
+        remote = tmp_path / "remote"
+        remote.mkdir()
+        _run(["git", "init", "-q"], cwd=remote)
+        _run(["git", "symbolic-ref", "HEAD", "refs/heads/main"], cwd=remote)
+
+        (remote / "config").mkdir()
+        (remote / "config" / "shared.yaml").write_text("shared: true\n")
+
+        skill_dir = remote / "rfq-assistant"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: rfq-assistant\ndescription: Test skill.\n"
+            "allowed_commands: []\ncli_packages: []\n"
+            "---\n\nSee `config/shared.yaml`.\n"
+        )
+
+        _run(["git", "add", "-A"], cwd=remote)
+        _run(
+            [
+                "git", "-c", "user.email=test@example.com", "-c", "user.name=test",
+                "commit", "-q", "-m", "init",
+            ],
+            cwd=remote,
+        )
+
+        root_patch, skill_root = self._patch_skill_root(tmp_path)
+
+        with root_patch:
+            with patch(
+                "harness_engineering_engine.handlers.skill_deployment.get_repo"
+            ) as mock_get_repo:
+                fake_repo = MagicMock()
+                fake_repo.list.return_value = FakeSkillListResult([])
+                mock_get_repo.return_value = fake_repo
+
+                with patch(
+                    "harness_engineering_engine.handlers.skill_deployment."
+                    "generate_missing_sections"
+                ) as mock_generate:
+                    mock_generate.return_value = {
+                        "reference_files": ["config/shared.yaml"],
+                    }
+
+                    result = deploy_skill_package(
+                        FakeInfo(), git_repository_url=str(remote), git_ref="main"
+                    )
+
+        assert result["failed"] == []
+        candidate_files_arg = mock_generate.call_args[0][-2]
+        assert "config/shared.yaml" in candidate_files_arg
+
+        pulled = skill_root / "rfq-assistant" / "config" / "shared.yaml"
+        assert pulled.is_file()
+
+        import json as _json
+
+        sidecar = skill_root / "rfq-assistant" / ".hsk-generated.json"
+        data = _json.loads(sidecar.read_text())
+        assert data["reference_files"] == ["config/shared.yaml"]
+
+    def test_pulled_file_excluded_from_registered_checksum(self, tmp_path):
+        """Deploying the same skill twice, with only the pulled-in
+        repo-root file's content changed between commits, must not change
+        the registered content_checksum for that skill — the file is a
+        copy of shared material, not this skill's own authored content."""
+        remote = self._make_repo_with_root_level_config(tmp_path)
+        root_patch, skill_root = self._patch_skill_root(tmp_path)
+
+        with root_patch:
+            with patch(
+                "harness_engineering_engine.handlers.skill_deployment.get_repo"
+            ) as mock_get_repo:
+                fake_repo = MagicMock()
+                fake_repo.list.return_value = FakeSkillListResult([])
+                mock_get_repo.return_value = fake_repo
+
+                result = deploy_skill_package(
+                    FakeInfo(), git_repository_url=str(remote), git_ref="main"
+                )
+        checksum_1 = result["deployed"][0]["content_checksum"]
+
+        (remote / "config" / "shared.yaml").write_text("shared: false\n")
+        _run(["git", "add", "-A"], cwd=remote)
+        _run(
+            [
+                "git", "-c", "user.email=test@example.com", "-c", "user.name=test",
+                "commit", "-q", "-m", "change shared config only",
+            ],
+            cwd=remote,
+        )
+
+        stale_row = MagicMock()
+        stale_row.name = "rfq-assistant"
+        stale_row.git_repository_url = str(remote)
+        stale_row.git_ref = "main"
+        stale_row.resolved_commit = "stale-sha"
+
+        with root_patch:
+            with patch(
+                "harness_engineering_engine.handlers.skill_deployment.get_repo"
+            ) as mock_get_repo:
+                fake_repo = MagicMock()
+                fake_repo.list.return_value = FakeSkillListResult([stale_row])
+                mock_get_repo.return_value = fake_repo
+
+                result = deploy_skill_package(
+                    FakeInfo(),
+                    git_repository_url=str(remote),
+                    git_ref="main",
+                    skill_name="rfq-assistant",
+                )
+        checksum_2 = result["deployed"][0]["content_checksum"]
+
+        assert checksum_1 == checksum_2
+
+
 class TestListAvailableFiles:
     """SKILL.md must never be a reference_files candidate — its content is
     already returned via body, so including it again would just be
@@ -567,4 +786,42 @@ class TestListAvailableFiles:
         files = _list_available_files(skill_dir)
 
         assert "SKILL.md" not in files
+        assert "notes.md" in files
+
+    def test_docs_folder_is_excluded(self, tmp_path):
+        skill_dir = tmp_path / "my-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("---\nname: x\n---\n\nBody.\n")
+        (skill_dir / "docs").mkdir()
+        (skill_dir / "docs" / "plan.md").write_text("Should never be a candidate.")
+        (skill_dir / "notes.md").write_text("Real reference content.")
+
+        files = _list_available_files(skill_dir)
+
+        assert "docs/plan.md" not in files
+        assert "notes.md" in files
+
+    def test_readme_is_excluded(self, tmp_path):
+        skill_dir = tmp_path / "my-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("---\nname: x\n---\n\nBody.\n")
+        (skill_dir / "README.md").write_text("Should never be a candidate.")
+        (skill_dir / "notes.md").write_text("Real reference content.")
+
+        files = _list_available_files(skill_dir)
+
+        assert "README.md" not in files
+        assert "notes.md" in files
+
+    def test_tests_folder_is_excluded(self, tmp_path):
+        skill_dir = tmp_path / "my-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("---\nname: x\n---\n\nBody.\n")
+        (skill_dir / "tests").mkdir()
+        (skill_dir / "tests" / "test_thing.py").write_text("Should never be a candidate.")
+        (skill_dir / "notes.md").write_text("Real reference content.")
+
+        files = _list_available_files(skill_dir)
+
+        assert "tests/test_thing.py" not in files
         assert "notes.md" in files

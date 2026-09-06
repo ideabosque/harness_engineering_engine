@@ -199,7 +199,42 @@ def skill(
 
     parsed = parse_skill_file(skill_md)
 
-    local_checksum = compute_content_checksum(skill_dir, Config.SKILL_LOCAL_METADATA_FILE)
+    # ------------------------------------------------------------------
+    # P9: fill any of allowed_commands/reference_files that SKILL.md left
+    # entirely absent from the generated-sections sidecar (never a field
+    # the author actually declared, even as an empty list — see
+    # docs/DEVELOPMENT_PLAN.md §5). A sidecar left over from a different
+    # commit than the one currently active is ignored, not trusted.
+    #
+    # Read before computing the checksum below: whichever reference_files
+    # entries deploy_skill_package pulled in from elsewhere in the repo
+    # (see reference_pull.pull_reference_files) were excluded from the
+    # *registered* checksum, so this host's local checksum must exclude
+    # them too — otherwise every skill with a pulled-in reference file
+    # would look permanently "stale" (or, with
+    # HSK_ALLOW_UNREGISTERED_CHANGES left at its documented default of
+    # false, make skill() raise on every read) even immediately after a
+    # clean deploy. That exclusion set lives in its own sidecar, separate
+    # from the human/agent-facing generated one — see
+    # skill_version_cache.write_checksum_exclusions.
+    # ------------------------------------------------------------------
+    declared_fields = set(parsed.raw_frontmatter.keys())
+    generated = skill_version_cache.read_generated_sidecar(skill_dir)
+    if generated and generated.get("resolved_commit") != active.get("resolved_commit"):
+        generated = None
+
+    checksum_exclusions = skill_version_cache.read_checksum_exclusions(skill_dir)
+    if checksum_exclusions and checksum_exclusions.get("resolved_commit") != active.get(
+        "resolved_commit"
+    ):
+        checksum_exclusions = None
+    pulled_reference_files = (
+        set(checksum_exclusions.get("excluded_relpaths", [])) if checksum_exclusions else set()
+    )
+
+    local_checksum = compute_content_checksum(
+        skill_dir, Config.SKILL_LOCAL_METADATA_FILE, excluded_relpaths=pulled_reference_files
+    )
     stale_index = local_checksum != active.get("content_checksum")
 
     if stale_index and not Config.ALLOW_UNREGISTERED_CHANGES:
@@ -207,18 +242,6 @@ def skill(
             f"Local content checksum for skill '{name}' differs from registered "
             f"checksum and HSK_ALLOW_UNREGISTERED_CHANGES is false."
         )
-
-    # ------------------------------------------------------------------
-    # P9: fill any of allowed_commands/reference_files that SKILL.md left
-    # entirely absent from the generated-sections sidecar (never a field
-    # the author actually declared, even as an empty list — see
-    # docs/DEVELOPMENT_PLAN.md §5). A sidecar left over from a different
-    # commit than the one currently active is ignored, not trusted.
-    # ------------------------------------------------------------------
-    declared_fields = set(parsed.raw_frontmatter.keys())
-    generated = skill_version_cache.read_generated_sidecar(skill_dir)
-    if generated and generated.get("resolved_commit") != active.get("resolved_commit"):
-        generated = None
 
     allowed_commands = parsed.frontmatter.allowed_commands
     if "allowed_commands" not in declared_fields and generated:

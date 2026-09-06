@@ -38,8 +38,8 @@ engine = HarnessEngineeringEngine(
 
 The engine exposes the following GraphQL operations:
 
-| Operation | Type | Permission |
-|---|---|---|
+| Operation | Type | Permission | Purpose |
+|---|---|---|---|
 | `ping` | Query | — | Ping the GraphQL service to confirm it is operational. |
 | `skills` | Query | Admin | Retrieve the full catalog of registered skills (admin use only). |
 | `searchSkills` | Query | Tenant-read | Semantic search across active skills available to an agent. |
@@ -72,24 +72,14 @@ mutation {
     gitRepositoryUrl: "git@github.com:ideabosque/autonomous-integration-testing-specialist.git"
     gitRef: "main"
   ) {
-    deployed {
-      skillUuid
-      name
-      version
-      isActive
-      resolvedCommit
-      sourceType
-    }
+    deployed
     skipped
-    failed {
-      name
-      error
-    }
+    failed
   }
 }
 ```
 
-* **Behavior**: Clones the repo at `gitRef`, reads `SKILL.md`, calculates internal checksums, and updates the local disk cache (`.hsk-versions/`) and database. Re-deploying an unmodified git commit natively resolves to a cheap `git ls-remote` (no clone) and returns the skill name in the `skipped` array.
+* **Behavior**: Clones the repo at `gitRef`, reads every `SKILL.md` found (recursively — see "Discovery" below), calculates internal checksums, and updates the local disk cache (`.hsk-versions/`) and database. Re-deploying an unmodified git commit resolves to a cheap `git ls-remote` (no clone) and returns that skill's name in `skipped`. `deployed`/`failed`/`skipped` are opaque JSON — `deployed` is a list of `{skillUuid, name, version, gitRepositoryUrl, gitRef, resolvedCommit, contentChecksum, isActive}`, `failed` a list of `{skill, error}`; neither accepts a GraphQL sub-selection.
 
 #### 2. runCommand (Mutation)
 
@@ -122,8 +112,9 @@ Integrates external Python packages stored on GitHub into the local environment 
 mutation {
   ensureCliPackage(packageName: "multilingual-slide-video-agent") {
     packageName
+    version
     status
-    message
+    error
   }
 }
 ```
@@ -142,14 +133,16 @@ query {
     body
     allowedCommands
     cliPackages
+    references
     gitRepositoryUrl
     gitRef
     resolvedCommit
+    staleIndex
   }
 }
 ```
 
-* **Behavior**: Resolves the skill's active version. If the active local copy on disk is missing or the internal checksum indicates drift, it automatically refreshes from Git pinned perfectly to the `resolvedCommit` recorded in the database. Returns the full `SKILL.md` body for prompt injection.
+* **Behavior**: Resolves the skill's active version. If the active local copy on disk is missing or the internal checksum indicates drift, it automatically refreshes from Git pinned perfectly to the `resolvedCommit` recorded in the database. Returns the full `SKILL.md` body for prompt injection, plus `references` — the resolved `{path, content}` list for whatever `reference_files` (declared or generated) resolves to.
 
 ### Skills are sourced from git only — no artifact store, no ZIP upload
 
@@ -178,6 +171,9 @@ passed directly to `Config.initialize()` as an engine setting dict.
 | `HSK_RUN_COMMAND_OUTPUT_LIMIT_BYTES` | No | Default output cap (default `20000`). |
 | `HSK_RUN_COMMAND_WORKSPACE_ROOT` | No | Workspace root for `workspace_dir` scope. |
 | `HSK_DRY_RUN` | No | Resolve and validate without executing (default `false`). |
+| `OPENAI_API_KEY` | No | Enables auto-generation of missing `allowed_commands`/`cli_packages`/`reference_files` at deploy time (see "Auto-generated sections" below). Shared with other engines in this gateway — not `HSK_`-prefixed. Empty disables generation; deploys still succeed with those fields simply absent. |
+| `OPENAI_BASE_URL` | No | Same shared setting as above. Empty = the OpenAI SDK's own default (`api.openai.com`). |
+| `HSK_OPENAI_MODEL` | No | Model used for generation (default `gpt-4o-mini`). Harness-specific, unlike the two settings above. |
 
 ---
 
@@ -193,7 +189,7 @@ skills/
       helper.py
 ```
 
-`SKILL.md` uses YAML frontmatter + a markdown instruction body. The frontmatter has two required fields and two optional ones:
+`SKILL.md` uses YAML frontmatter + a markdown instruction body. Only `name`/`description` are required — leave the rest out entirely and deploy-time generation fills in what it can (see "Auto-generated sections" below):
 
 ```markdown
 ---
@@ -208,6 +204,8 @@ cli_packages:
     git_repository_url: https://github.com/ideabosque/multilingual_slide_video_production_system.git
     version: "0.1.0"
     git_ref: main
+reference_files:
+  - "notes.md"
 ---
 
 You are a helpful assistant. Follow these steps...
@@ -217,8 +215,9 @@ You are a helpful assistant. Follow these steps...
 |---|---|---|
 | `name` | Yes | The skill's registered identity — must be unique per tenant. |
 | `description` | Yes | Shown in `searchSkills`/`skill` results; also what agents match against. |
-| `allowed_commands` | No | The **only** commands `runCommand` will ever execute for this skill (see "Security model" below). Omitted or empty means `runCommand` is fully denied for this skill. |
-| `cli_packages` | No | External Python CLI dependencies this skill needs. Each entry needs at least `package_name`; adding `git_repository_url` and `version` makes it auto-registered *and* installed the moment the skill is deployed (see "CLI package dependencies" below) — omit them if the package is already registered separately via `insertUpdateCliPackage`. |
+| `allowed_commands` | No | The **only** commands `runCommand` will ever execute for this skill (see "Security model" below). Omitted or empty means `runCommand` is fully denied for this skill. Left out of `SKILL.md` entirely (not even as `[]`) and deploy-time generation may propose one — see "Auto-generated sections". |
+| `cli_packages` | No | External Python CLI dependencies this skill needs. Each entry needs at least `package_name`; adding `git_repository_url` and `version` makes it auto-registered *and* installed the moment the skill is deployed (see "CLI package dependencies" below) — omit them if the package is already registered separately via `insertUpdateCliPackage`. Left out entirely, deploy-time discovery may find one already installed on the host and register it as documentation, without installing anything new. |
+| `reference_files` | No | Paths, relative to the skill directory, whose content `skill(name)` returns alongside `body` in a `references` field — for prose/config the agent needs to read, never scripts. May name a path that lives elsewhere in the same repo (see "Auto-generated sections"). |
 
 ### Discovery
 
@@ -230,13 +229,24 @@ You are a helpful assistant. Follow these steps...
 
 - **Empty or missing means denied, not "anything goes."** `runCommand` raises `PermissionError` immediately if a skill's `allowed_commands` is empty — there is no fallback to "allow everything."
 - **Only exact, listed `argv` entries match.** `runCommand` never invokes a shell (`shell=False`) and never accepts an argv that isn't already in this list.
-- **Only include commands you actually want a tenant-level caller able to run right now, unprompted.** If a CLI package exposes a command meant to be gated behind a human decision in conversation (a publish/approve/delete-style action), leave it out of `allowed_commands` even though the package is installed and the command technically exists — installing a `cli_packages` dependency does not imply every one of its subcommands should be runnable. There is currently no tooling that generates or suggests this list for you; the author has to already know (e.g. via the CLI's own `--help`) which subcommands exist and decide which ones belong here.
+- **Only include commands you actually want a tenant-level caller able to run right now, unprompted.** If a CLI package exposes a command meant to be gated behind a human decision in conversation (a publish/approve/delete-style action), leave it out of `allowed_commands` even though the package is installed and the command technically exists — installing a `cli_packages` dependency does not imply every one of its subcommands should be runnable. If you leave `allowed_commands` out of `SKILL.md` entirely, deploy-time generation follows this same rule when proposing one (see "Auto-generated sections") — but a generated allowlist is a best-effort proposal grounded in your skill's own wording, not a substitute for reviewing it yourself before trusting it in a shared environment.
 
 ### CLI package dependencies
 
 When a `cli_packages` entry includes `git_repository_url` and `version`, `deploySkillPackage` auto-registers it (equivalent to `insertUpdateCliPackage`) and installs/verifies it immediately (equivalent to `ensureCliPackage`) as part of that same deploy call — not deferred to the first `runCommand`. A failed install fails only that skill's entry in the deploy response (`failed`), it does not abort deploying the rest of a multi-skill repo, and the skill itself is not registered if its dependency can't be installed.
 
 There is no database-level link between a skill and a CLI package — the only association is the `package_name` string appearing in both the skill's `SKILL.md` and the `hsk_cli_packages` registration row, matched at read/execute time. Renaming or deleting a CLI package registration does not update or block any skill that still references its old name; the next `runCommand` call for that skill would simply get a "not registered" error from `ensure_package`.
+
+### Auto-generated sections
+
+Leave `allowed_commands`, `cli_packages`, and/or `reference_files` out of `SKILL.md` entirely (not even as `[]`) and `deploySkillPackage` proposes values for whichever ones are missing. **A field you did write is never touched, even if you wrote it as an empty list** — generation only ever fills a key that's genuinely absent from the frontmatter. Two different mechanisms, matched to two different risk levels:
+
+- **`cli_packages`** is discovered locally, with no LLM call at all: your skill's body text is scanned for backtick-quoted command names (`` `msv pipeline status` `` → `msv`), and each candidate is checked against what's *actually installed* on the deploying host. A name that doesn't resolve to a real installed command is dropped — nothing is invented, and nothing gets installed as a side effect of this. Everyday dev tools mentioned in passing (`pip`, `python`, `git`, `npm`, `docker`, ...) are ignored even when installed, since they're almost never the skill's own dependency.
+- **`allowed_commands`/`reference_files`** are proposed by an LLM (`OPENAI_API_KEY` required — see Configuration), but grounded in real, checkable state: the model sees your skill's actual body text, the real command tree of whatever `cli_packages` it has (declared or discovered), and the real file list it can choose `reference_files` from — never invents a command or a path. Everything it proposes is re-validated against that same real data afterward.
+
+**`reference_files` can reach outside the skill's own folder.** In a monorepo where shared material (config, or a CLI dependency's own source) lives at the repo root rather than duplicated into every skill, generation is allowed to consider those files too — whatever it picks (or whatever you declared) gets copied into your skill's own installed folder automatically, so `skill(name)` never needs to know about the rest of the repo. `SKILL.md`, `README.md`, and anything under a `docs/` or `tests/` folder are never candidates.
+
+Generated values live in a local file next to the installed `SKILL.md` (`.hsk-generated.json`) — inspect it if you want to see exactly what was proposed for your skill. It's regenerated on every deploy (never on a skipped, unchanged-commit redeploy), and a failed/misconfigured OpenAI call just leaves those fields absent rather than failing your deploy.
 
 ---
 

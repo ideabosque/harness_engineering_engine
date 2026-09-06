@@ -88,3 +88,41 @@ class TestChecksums:
             with_sidecar = compute_content_checksum(skill_dir, ".hsk-skill.json")
 
             assert with_sidecar == without_sidecar
+
+    def test_excluded_relpaths_ignores_only_the_exact_path(self):
+        """A file pulled in from elsewhere in the repo (see reference_pull)
+        must not affect the checksum, but excluding it must be scoped to
+        its exact relative path — a different, deliberately-authored file
+        that happens to share a basename elsewhere in the skill's own
+        directory must still count."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill_dir = root / "test-skill"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: test\ndescription: test\n---\n\nBody.\n"
+            )
+
+            baseline = compute_content_checksum(skill_dir, ".hsk-skill.json")
+
+            (skill_dir / "config").mkdir()
+            (skill_dir / "config" / "shared.yaml").write_text("pulled in content\n")
+
+            with_pulled_excluded = compute_content_checksum(
+                skill_dir,
+                ".hsk-skill.json",
+                excluded_relpaths={"config/shared.yaml"},
+            )
+            assert with_pulled_excluded == baseline
+
+            with_pulled_included = compute_content_checksum(skill_dir, ".hsk-skill.json")
+            assert with_pulled_included != baseline
+
+            (skill_dir / "other").mkdir()
+            (skill_dir / "other" / "shared.yaml").write_text("a real, authored file\n")
+            with_authored_sibling = compute_content_checksum(
+                skill_dir,
+                ".hsk-skill.json",
+                excluded_relpaths={"config/shared.yaml"},
+            )
+            assert with_authored_sibling != with_pulled_excluded

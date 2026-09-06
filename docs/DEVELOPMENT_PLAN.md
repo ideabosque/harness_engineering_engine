@@ -1,8 +1,8 @@
 # Harness Engineering - Development Plan
 
 > **Location:** `C:\Users\bibo7\gitrepo\silvaengine\harness_engineering_engine`
-> **Date:** 2026-09-04
-> **Status:** P1-P5 built and wired end to end; P6 partial; CLI package manager stubbed (v1.1); skill deployment now sources directly from git — no S3 or other artifact store; P8 (recursive discovery + CLI package auto-register/install) done
+> **Date:** 2026-09-06
+> **Status:** P1-P6 built and wired end to end; CLI package manager stubbed (v1.1); skill deployment sources directly from git — no S3 or other artifact store; P8 (recursive discovery + CLI package auto-register/install) done; P9 (`reference_files` + OpenAI-assisted section generation) done and verified live against real repos
 
 ### Implementation status
 
@@ -16,9 +16,9 @@
 | P6 | Starter skills (`rfq-assistant`, `release-notes`) and templates | Partial - authoring/operator guides not yet written |
 | v1.1 | Python CLI package manager (§11) | Stubbed - `CliPackageManager.ensure_package()` raises `NotImplementedError` by design; skills must use local scripts until this ships |
 | P8 | Recursive `SKILL.md` discovery; `cli_packages` auto-register + auto-install at deploy time | Done, see Known issue #6 (fixed) |
-| P9 | `reference_files`/`references`; OpenAI-assisted generation of missing `allowed_commands`/`cli_packages`/`reference_files` into a checksum-exempt local sidecar, regenerated every deploy | Not scheduled - design only, see §5 and §14 P9 |
+| P9 | `reference_files`/`references`; OpenAI-assisted generation of missing `allowed_commands`/`cli_packages`/`reference_files`; repo-wide reference-file pull-in; checksum-exclusion bookkeeping | Done, see §5 and §14 P9, and Known issue #7 (fixed) |
 
-Test coverage today (59 tests): `checksums`, `command_executor` (kill switch, allowlist match/reject, shell-metacharacter rejection, dry run), `config`, `skill_frontmatter`, `queries.skill::resolve_skill` (name dispatch, not-found handling, uuid fallback), `skill_deployment` (first-version auto-activation, promote-gating, redeploy-skip against real local git repos; recursive `SKILL.md` discovery, `cli_packages` auto-register+install, install-failure isolation, and a no-cli_packages regression guard — see Known issue #6), CLI package manager (registration, install, upgrade, verify, failure handling), integration scenarios against local Postgres (registration, git deploy, on-demand git refresh, promote/rollback, command policy), and resilience/reconciliation (missing data, invalid data, disabled skills, cross-tenant RLS, kill-switch, resolved-commit integrity, single-active-version, content checksum). Not yet covered: auth/tenant boundaries beyond RLS, full MCP integration, and command-executor timeout/output-cap/path-traversal behavior (see §15).
+Test coverage today (135 tests): `checksums` (including `excluded_relpaths` scoping and the two generated sidecars' exclusion), `command_executor` (kill switch, allowlist match/reject, shell-metacharacter rejection, dry run), `config`, `skill_frontmatter` (including `reference_files`), `cli_introspection` (click command-tree walking, installed-console-script reverse lookup), `section_generator` (ambient-tooling denylist, cli_packages discovery, OpenAI call mocked throughout, markdown-fence stripping), `reference_pull` (native vs. pulled-in resolution, traversal rejection), `skill_version_cache` (generated-sections sidecar and checksum-exclusions sidecar round-trip + promote carry-over), `skill_reader` (SKILL.md-declared-vs-sidecar-generated precedence, stale-sidecar/stale-exclusions-by-commit rejection, the P9 `staleIndex` regression — see Known issue #7), `queries.skill::resolve_skill` (name dispatch, not-found handling, uuid fallback), `skill_deployment` (first-version auto-activation, promote-gating, redeploy-skip against real local git repos; recursive `SKILL.md` discovery, `cli_packages` auto-register+install, install-failure isolation, no-cli_packages regression guard, repo-wide reference-file widening/pull-in, docs/tests/README.md exclusion), CLI package manager (registration, install, upgrade, verify, failure handling), integration scenarios against local Postgres (registration, git deploy, on-demand git refresh, promote/rollback, command policy), and resilience/reconciliation (missing data, invalid data, disabled skills, cross-tenant RLS, kill-switch, resolved-commit integrity, single-active-version, content checksum). Not yet covered: auth/tenant boundaries beyond RLS, full MCP integration, and command-executor timeout/output-cap/path-traversal behavior (see §15).
 
 ### Known issues (found by tracing the code against this plan, now fixed)
 
@@ -29,6 +29,7 @@ Test coverage today (59 tests): `checksums`, `command_executor` (kill switch, al
 5. **Fixed (architecture change, not a bug).** ZIP-sourced deployment has been removed entirely. `deploySkillPackage` now only accepts a git remote — the `sourceType` GraphQL argument and the `source_type` parameter on `deploy_skill_package()` are gone, since there is only one supported value. The local per-version cache (`handlers/skill_version_cache.py`) is retained: it still makes `promoteSkillVersion`/`rollbackSkill` instant (no remote fetch on every promotion), and every host that never cached a given version falls back to fetching it straight from git, pinned to the registered commit. `source_type`/`git_repository_url` columns are kept on the registration row (always `"git"` going forward) rather than removed, to avoid a second schema churn in the same week. Covered by `tests/test_skill_deployment.py`, `tests/test_integration.py`, `tests/test_resilience.py` (all rewritten to deploy from real local git repos).
 
 6. **Fixed.** `deploySkillPackage` could not fully onboard a skill that (a) nested `SKILL.md` more than one directory deep in its repo, and/or (b) declared a `cli_packages` dependency that had never been separately registered or installed. Raised while evaluating a real external repo shaped this way (`multilingual_slide_video_production_system`). Discovery was `content_root.glob("*/SKILL.md")` plus a root-level fallback — no recursive search, so a `SKILL.md` nested under a further subfolder (e.g. `src/skills/<name>/SKILL.md`) failed with "No SKILL.md found." Separately, a skill's `cli_packages` frontmatter was purely declarative: it was read only at `runCommand` time, and `ensure_package()` required the package to already exist via a prior `insertUpdateCliPackage` call — no path registered or installed a declared `cli_packages` entry automatically. **Applied:** discovery is now recursive (`content_root.rglob("SKILL.md")`, pruning `.git`, `handlers/skill_deployment.py:164-170`); a new `_ensure_cli_packages()` helper runs per discovered skill, right before that skill's DB row is written — it auto-registers (`register_cli_package`) any `cli_packages` entry that carries `git_repository_url`+`version` (entries without those are assumed pre-registered), then always calls `ensure_package()` to install/verify immediately at deploy time (decided 2026-09-04 in favor of installing right away rather than deferring to first `runCommand`, accepting that deploy now depends on network/pip and may install on a host that never ends up running that skill). A failed install raises, landing that skill in `failed` rather than registering a skill whose declared dependency doesn't actually work — the skill row is never written in that case. `runCommand`'s existing `ensure_package()` call is unchanged and acts as a cheap safety-net re-check. Covered by `tests/test_skill_deployment.py::TestDeploySkillPackageDiscoveryAndCliPackages` (nested discovery, auto-register+install success, install-failure isolation, and a no-op regression guard for skills with no `cli_packages`).
+7. **Fixed.** A skill deployed cleanly with P9's repo-wide reference-file pull-in (§5) came back from `skill(name)` with `stale_index: true` even immediately after deploy — and, with `HSK_ALLOW_UNREGISTERED_CHANGES` at its documented default of `false`, would have made `skill()` raise on *every* read instead. Root cause: `deploySkillPackage` registers `content_checksum` computed with pulled-in `reference_files` entries excluded (they're a copy of material the skill doesn't itself author, living elsewhere in the same repo — see §5), but `skill_reader.skill()`'s own read-time checksum recomputation recomputed over the full installed directory with no such exclusion, so the two could never match for any skill that had pulled in even one file. Found live, from the actual GraphQL response, while inspecting `skill(name)` output for a real deployed skill. **Applied:** the excluded-path set is now recorded at deploy time in its own local sidecar (`.hsk-checksum-exclusions.json`, itself checksum-exempt and carried across `promoteSkillVersion`/`rollbackSkill` the same way the generated-sections sidecar already is — see §5) and re-read by `skill()` before it recomputes the local checksum, so the same paths are excluded on both sides of the comparison. Deliberately kept out of `.hsk-generated.json`: that file is what an author or agent inspects to see "what got generated for this skill"; the exclusion list is pure internal bookkeeping nobody needs to read. Covered by `tests/test_skill_reader.py::test_pulled_reference_file_does_not_falsely_flag_stale_index` and `test_checksum_exclusions_from_a_different_commit_are_ignored`, `tests/test_skill_version_cache.py::TestChecksumExclusions`, `tests/test_skill_deployment.py::test_pulled_reference_files_recorded_in_checksum_exclusions_sidecar`.
 
 ---
 
@@ -242,6 +243,9 @@ Do not hardcode the skill folder or command execution behavior. The engine and s
 | `HSK_RUN_COMMAND_OUTPUT_LIMIT_BYTES` | No | Default stdout/stderr cap when an `allowed_commands` entry does not specify one. |
 | `HSK_RUN_COMMAND_WORKSPACE_ROOT` | No | Optional workspace root used when `workspace_scope` is `workspace_dir`. |
 | `HSK_DRY_RUN` | No | Resolve and validate `run_command` without executing it. Useful for tests and deployment checks. |
+| `OPENAI_API_KEY` | No | P9 section generation (§5). Shared, non-`HSK_`-prefixed setting — other engines in this gateway use the same key for their own OpenAI calls. Empty disables generation entirely; deploys still succeed, the fields simply stay absent. |
+| `OPENAI_BASE_URL` | No | P9 section generation. Same shared setting as above; empty means the OpenAI SDK's own default (`api.openai.com`). |
+| `HSK_OPENAI_MODEL` | No | P9 section generation. Harness-specific, unlike the two settings above. Default `gpt-4o-mini`. |
 
 Configuration should be server-side and tenant-aware where needed. Agent-facing MCP tools must not accept arbitrary filesystem roots, environment variables, or execution policy overrides.
 
@@ -323,21 +327,40 @@ Required frontmatter fields:
 | `description` | Yes | Searchable summary and usage guidance. |
 | `allowed_commands` | No | Structured argv allowlist for `run_command`. If omitted, the skill is read-only (deny-by-default — see Known issue #6). |
 | `cli_packages` | No | External Python CLI dependencies. An entry with `git_repository_url`+`version` is auto-registered and installed at deploy time (P8); one without them is assumed pre-registered via `insertUpdateCliPackage`. |
-| `reference_files` | No (planned, P9) | Explicit list of paths/globs, relative to the skill directory, whose content should be returned alongside `body` in `skill(name)` — for prose/config the agent needs to read, never for scripts (those stay execution-only, referenced by path inside `allowed_commands`). |
+| `reference_files` | No | Explicit list of paths, relative to the skill directory, whose content should be returned alongside `body` in `skill(name)`. For prose/config the agent needs to read — never for scripts (those stay execution-only, referenced by path inside `allowed_commands`). May name a path that isn't physically in the skill's own folder yet; see "Repo-wide reference files" below. |
 
 Recommendation: use structured `allowed_commands` entries rather than shell-like strings. This avoids ambiguity around quoting, redirection, pipes, and path traversal.
 
-### Reference files and auto-generated sections (planned, P9)
+### Reference files and auto-generated sections (P9 — done)
 
-`reference_files` is additive and orthogonal to `allowed_commands`/`cli_packages` — a path can appear on it, on `allowed_commands`, on both, or neither. `skill(name)` reads every listed file (containment-checked against the skill's own directory, same rule as everywhere else path input is trusted) and returns `{"path": ..., "content": ...}` per entry in a new `references` field, alongside the existing `body`/`allowedCommands`/`cliPackages`. Globs are supported so an author can opt a whole folder in (`"references/*.md"`) without enumerating every file, but the list itself is always explicit — nothing is included that isn't named or matched by a pattern the author wrote.
+`reference_files` is additive and orthogonal to `allowed_commands`/`cli_packages` — a path can appear on it, on `allowed_commands`, on both, or neither. `skill(name)` reads every listed file (containment-checked against the installed skill directory, same rule as everywhere else path input is trusted) and returns `{"path": ..., "content": ...}` per entry in a `references` field, alongside the existing `body`/`allowedCommands`/`cliPackages`. `SKILL.md` itself is never returned as a reference, even if an author explicitly lists it — its content is already in `body`.
 
-**Auto-generation, only when a field is absent.** When a skill declares a `cli_packages` dependency but leaves `allowed_commands` and/or `reference_files` out of its `SKILL.md` entirely, `deploySkillPackage` calls the OpenAI Completions API to propose values for whichever fields are missing — grounded in the skill's own body text (which is where an author documents things like a human-approval gate in prose, e.g. the `multilingual-slide-video-agent` skills' "Human review gate" section) plus the CLI package's introspected command tree (`click`'s `Group.commands`, same mechanism explored for the reverted `suggestAllowedCommands`). **A field the author already populated in `SKILL.md` is never touched or overridden — generation only fills a genuinely empty field.** This is a materially different design from the `allowed_commands_override`/`cli_packages_override` DB-column approach explored and reverted earlier in this document: there is no database column here at all.
+#### Auto-generation, only when a field is genuinely absent
 
-**Where generated values are stored, and why.** Generated values are written to a new local sidecar file next to the installed `SKILL.md` (e.g. `.hsk-generated.json`), *excluded from `content_checksum`* the same way `.hsk-skill.json` already is (`compute_content_checksum(skill_dir, Config.SKILL_LOCAL_METADATA_FILE)`'s second argument already excludes one file by name; this adds a second exclusion). This is the load-bearing design choice: `skill_refresh.py` always re-derives local content from git and compares against the checksum registered at deploy time, so if generated values were folded into checksum-covered content, every future on-demand refresh would look permanently stale (refresh re-clones the original, non-generated `SKILL.md` from git, which will never match a checksum computed after generation). Keeping the sidecar checksum-exempt means the existing refresh/checksum machinery is completely unaffected by this feature.
+When a skill's `SKILL.md` leaves `allowed_commands`, `cli_packages`, and/or `reference_files` out of its frontmatter entirely, `deploySkillPackage` proposes values for whichever of those fields are missing. **A field the author already populated — even as an explicit empty list — is never touched or overridden; generation only fills a key that's genuinely absent from the raw YAML.** This is a materially different design from the `allowed_commands_override`/`cli_packages_override` DB-column approach explored and reverted earlier in this document: there is no database column here at all, and no `suggestAllowedCommands`-style tool exposed to callers either (also explored and reverted) — generation happens once, automatically, at deploy time.
 
-**Failure mode.** An OpenAI call failure/timeout during deploy does not fail the skill's deploy — the missing field(s) simply stay empty, preserving `allowed_commands`' deny-by-default guarantee (no partial/malformed allowlist ever gets written from a failed generation).
+Two independent mechanisms, matched to two different risk profiles:
 
-**Regeneration frequency — resolved 2026-09-05: every deployment.** For a skill that leaves `allowed_commands`/`reference_files` empty, every `deploySkillPackage` call regenerates the sidecar from scratch (not just the first, not conditional on the sidecar already existing) — so it always reflects the CLI package's *current* command surface as of that deploy, at the cost of an OpenAI call (and possible small variance) on every such deploy. The redeploy-skip path (unchanged commit, `skillName` given) still short-circuits before cloning at all, so an unchanged skill does not trigger regeneration either — this only fires on an actual new deploy.
+- **`cli_packages` discovery is deterministic and LLM-free.** `handlers/section_generator.py` scans the skill's body text for backtick-quoted command tokens (`` `msv pipeline status` `` → candidate `msv`) and checks each against every *actually installed* console-script on the deploying host (`handlers/cli_introspection.py::find_installed_packages_for_commands`, via `importlib.metadata`). A candidate that isn't installed is simply dropped — nothing is invented, no `git_repository_url` is guessed, and no package is installed as a side effect of discovery. An **ambient-tooling denylist** (`pip`, `python`, `git`, `npm`, `docker`, and similar) is checked before that lookup ever runs, since these are near-universal dev tools that show up in setup asides ("installed via `` `pip install -e .` ``") rather than a skill's own domain dependency — without it, a skill mentioning `pip` in a setup note would get `pip` itself registered as a `cli_packages` entry.
+- **`allowed_commands`/`reference_files` are OpenAI-backed, but grounded in real, locally-observable state — never trusted blind.** The model is given the skill's own body text, the *real* introspected command tree (`click`'s `Group.commands`, walked recursively) of every declared-or-discovered `cli_packages` entry, and the actual list of candidate files on disk (see "Repo-wide reference files" below) — never an invented argv or path. Every proposed value is re-validated against that same real data after the call returns, before it's trusted: an `allowed_commands` entry must resolve to a real command in the introspected tree; a `reference_files` entry must be in the candidate file list. `allowed_commands` is a strict allowlist — the prompt instructs the model to exclude any subcommand the body text treats as gated behind human approval (an "approve"/"publish"/"release"-style action), even though the command is real and installed.
+
+#### Repo-wide reference files
+
+A monorepo often keeps shared reference material — config, and even a CLI dependency's own source — at the repository root rather than duplicated into every skill's own folder (the real-world case this was built against: `multilingual_slide_video_production_system`, where every skill's own directory contains nothing but `SKILL.md`, and the actual config/source it needs lives at the repo root). `skill(name)`'s read path only ever looks inside the installed skill directory, by design, so `deploySkillPackage` bridges that gap at deploy time:
+
+- **Candidate widening.** When `reference_files` is absent, `handlers/skill_deployment.py::_list_repo_wide_files` widens the generation candidate pool beyond the skill's own folder to the *whole* cloned repository — excluding every other discovered skill's own directory (so one skill's generation is never handed another skill's internal files), `SKILL.md`/`README.md` anywhere, and anything under a `docs` or `tests` folder (none of that is reference material a skill needs a copy of).
+- **Pulling the chosen files in.** Whichever `reference_files` a skill ends up with — declared or generated — that name a path outside the skill's own directory get physically copied in from wherever else in the same repo clone they live (`handlers/reference_pull.py::pull_reference_files`, containment-checked against both the skill directory and the repo root) before the skill is checksummed. This is why `skill(name)`'s read path never needs any knowledge of the wider repo layout — by the time it runs, the files are just sitting in the installed skill directory like any other content.
+- **Checksum consistency.** A pulled-in file is a copy of material the skill doesn't itself author, so it's excluded from `content_checksum` — but only the pulled-in subset, by exact relative path (`compute_content_checksum`'s `excluded_relpaths` argument), never by basename; a *native* reference file with the same name deliberately authored inside the skill's own folder must still count toward the checksum. `handlers/skill_refresh.py::refresh_single_skill` mirrors the same pull-in step for a skill's *declared* `reference_files` when a different host refreshes straight from git, so the checksum it recomputes matches what was originally registered. (Generated-only `reference_files` aren't reproducible from a plain refresh on a different host — same boundary the generated-sections sidecar already has, see below.)
+
+#### Where generated values are stored, and why there are two sidecar files
+
+Generated `allowed_commands`/`cli_packages`/`reference_files` are written to a local sidecar file next to the installed `SKILL.md`, `.hsk-generated.json` — the file an author or agent would actually inspect to see "what got generated for this skill." A second, separate sidecar, `.hsk-checksum-exclusions.json`, records which specific `reference_files` paths were pulled in from elsewhere (see above) — pure internal bookkeeping `skill()`'s own read-time checksum recomputation needs, nothing a human needs to see, so it's kept out of the human-facing file entirely.
+
+Both sidecars are *excluded from `content_checksum`* the same way `.hsk-skill.json` already is (`compute_content_checksum`'s `metadata_filename` argument excludes one file by basename; `GENERATED_SIDECAR_FILENAME` and `CHECKSUM_EXCLUSIONS_FILENAME` add two more). This is the load-bearing design choice behind the whole feature: `skill_refresh.py` always re-derives local content from git and compares against the checksum registered at deploy time, so if either sidecar's own content were folded into checksum-covered content, every future on-demand refresh would look permanently stale. Both sidecars are dotfiles living in the local per-version cache (`HSK_SKILL_ROOT/.hsk-versions/<name>/<version>/`), and both are carried across explicitly by `install_from_cache` when a version is promoted — the same copytree that installs a cached version's content already ignores dotfiles (to correctly drop `.git`), so each sidecar needs its own explicit `shutil.copy2` alongside that copy, exactly like `.hsk-skill.json` already gets its own separate write.
+
+**Failure mode.** An OpenAI call failure/timeout/malformed response during deploy does not fail the skill's deploy — the missing field(s) simply stay absent, preserving `allowed_commands`' deny-by-default guarantee (no partial/malformed allowlist is ever written from a failed generation). `cli_packages` discovery has no such failure mode at all — it's local and synchronous, no network call involved.
+
+**Regeneration frequency — every deployment.** For a skill that leaves any of these three fields absent, every `deploySkillPackage` call regenerates both sidecars from scratch (not just the first, not conditional on either sidecar already existing) — so they always reflect the CLI package's *current* command surface and the repo's *current* file layout as of that deploy, at the cost of an OpenAI call (and possible small variance) on every such deploy. The redeploy-skip path (unchanged commit, `skillName` given) still short-circuits before cloning at all, so an unchanged skill never re-triggers this.
 
 ---
 
@@ -545,7 +568,7 @@ The engine owns the GraphQL contract.
 | `searchSkills(query, limit)` | Query | Agent through MCP | Return ranked `name` and `description` matches. |
 | `skill(name)` | Query | Agent through MCP | Resolve the active version, refresh local cache from git if needed, read `SKILL.md`, and return body, metadata, and allowlist. |
 
-`skill(name)` should return:
+`skill(name)` returns:
 
 ```text
 name
@@ -553,8 +576,9 @@ version
 description
 body
 allowed_commands
+cli_packages
+references
 local_path
-source_type
 git_repository_url
 git_ref
 resolved_commit
@@ -564,6 +588,8 @@ stale_index
 deployment_status
 updated_at
 ```
+
+`allowed_commands`/`cli_packages`/`reference_files` are each SKILL.md's own declared value if the author wrote it, otherwise whatever P9 generated for that field (§5) — never a mix of the two for the same field. `references` is the resolved `{"path": ..., "content": ...}` list for whatever `reference_files` value that resolves to.
 
 ### Search scope
 
@@ -912,18 +938,21 @@ harness_engineering_engine/
   py.typed
   handlers/
     __init__.py
-    config.py                # Centralized Config class (like rfq_engine)
-    checksums.py             # Content checksums
+    config.py                # Centralized Config class (like rfq_engine); OPENAI_API_KEY/OPENAI_BASE_URL/HSK_OPENAI_MODEL (P9)
+    checksums.py             # Content checksums; excludes both P9 sidecar filenames
     command_executor.py      # Guarded run_command
     cli_package_manager.py   # CLI package registration/install (v1.1)
+    cli_introspection.py     # P9: click command-tree walking + installed-console-script reverse lookup
+    section_generator.py     # P9: OpenAI-backed allowed_commands/reference_files + deterministic cli_packages discovery
+    reference_pull.py        # P9: pull a reference_files entry in from elsewhere in the repo clone
     git_client.py            # git ls-remote / clone, SSH identity handling
-    skill_deployment.py      # deploySkillPackage — git intake + local install + register
-    skill_frontmatter.py     # YAML frontmatter parser
+    skill_deployment.py      # deploySkillPackage — git intake + local install + register + P9 generation/pull-in
+    skill_frontmatter.py     # YAML frontmatter parser (incl. reference_files)
     skill_path.py            # Guarded filesystem helpers
-    skill_reader.py          # skill(name) — on-demand refresh + body retrieval
-    skill_refresh.py         # refreshLocalSkills — git fetch + atomic replace
+    skill_reader.py          # skill(name) — on-demand refresh + body/references retrieval
+    skill_refresh.py         # refreshLocalSkills — git fetch + atomic replace (+ P9 reference-file pull-in mirror)
     skill_registration.py    # registerSkills — scan + upsert
-    skill_version_cache.py   # per-version local cache backing promote/rollback
+    skill_version_cache.py   # per-version local cache backing promote/rollback; P9's two sidecars
   models/
     __init__.py
     dynamodb/
@@ -1136,26 +1165,32 @@ Exit criteria (met):
 - A CLI package install failure during deploy is reported per-skill in `failed`, not raised as an unhandled exception that aborts the rest of a multi-skill deploy.
 - Covered by `tests/test_skill_deployment.py::TestDeploySkillPackageDiscoveryAndCliPackages` (4 tests, all mocked — no real `pip`/network calls).
 
-### P9 - Reference files + LLM-assisted section generation (not scheduled)
+### P9 - Reference files + LLM-assisted section generation (done, 2026-09-06)
 
-See §5 "Reference files and auto-generated sections" for the full design. Two independent parts:
+See §5 "Reference files and auto-generated sections" for the full design; this section tracks what actually shipped and how it was verified. Delivered in three layers, each built and validated in turn against real repos through a live gateway, not just against mocked tests:
 
-1. **`reference_files`** — a new optional frontmatter field; `skill(name)` reads every listed path/glob (containment-checked) and returns its content in a new `references` field. Purely additive, no interaction with `allowed_commands`/`cli_packages`.
-2. **Auto-generation** — when a skill declares `cli_packages` but leaves `allowed_commands`/`reference_files` empty, `deploySkillPackage` calls the OpenAI Completions API (grounded in the skill's own body text plus the CLI package's introspected `click` command tree) to propose values for the missing field(s) only — never touching a field the author already populated. Generated values are written to a new local sidecar file (`.hsk-generated.json`) excluded from `content_checksum`, so the existing refresh/checksum machinery is unaffected. A failed OpenAI call leaves the field empty rather than failing the deploy.
+1. **`reference_files`/`references`** — a new optional frontmatter field; `skill(name)` reads every resolved path (containment-checked against the installed skill directory) and returns its content in a `references` field. Purely additive, no interaction with `allowed_commands`/`cli_packages`. `SKILL.md` is never returned as a reference even if explicitly named, since its content is already in `body`.
+2. **Auto-generation for whichever of `allowed_commands`/`cli_packages`/`reference_files` a skill's `SKILL.md` leaves genuinely absent** — never a field the author already populated, even with an empty list. `cli_packages` discovery is local and deterministic (backtick-quoted command tokens in the body, matched against real installed console-scripts, filtered through an ambient-tooling denylist); `allowed_commands`/`reference_files` are OpenAI-backed but grounded in the skill's real body text, the CLI package's real introspected command tree, and the real candidate file list, with every proposed value re-validated against that same real data before being trusted.
+3. **Repo-wide reference-file pull-in** — for a monorepo where reference material (config, a CLI dependency's own source) lives outside any individual skill's own folder, generation candidates widen to the whole repo clone (excluding other skills' own folders, `SKILL.md`/`README.md`, and `docs`/`tests` folders), and whichever `reference_files` a skill ends up with — declared or generated — get physically pulled into that skill's own installed directory before checksumming, with the pulled-in subset excluded from `content_checksum` by exact path.
 
 Deliver:
 
-- `reference_files` frontmatter parsing (`handlers/skill_frontmatter.py`) and a `references` field on `SkillType`/`skill(name)` (`types/skill.py`, `handlers/skill_reader.py`), each entry containment-checked against the installed skill directory.
-- A `.hsk-generated.json` sidecar mechanism: written by `deploySkillPackage` when applicable, excluded from `compute_content_checksum`'s walk (second exclusion alongside `Config.SKILL_LOCAL_METADATA_FILE`), read by `skill_reader.skill()` to fill any of `allowed_commands`/`cli_packages`/`reference_files` the `SKILL.md` itself left empty.
-- The OpenAI-backed generation call itself, isolated behind a single function so it can be mocked entirely in tests (no real API calls in the suite) and so a missing/invalid API key degrades to "no generation" rather than failing deploys.
-- Regenerates on every deploy of a skill leaving these fields empty (resolved 2026-09-05 — see §5); the existing redeploy-skip path (unchanged commit) still avoids it since it never clones at all.
+- `reference_files` frontmatter parsing (`handlers/skill_frontmatter.py`) and a `references` field on `SkillType`/`skill(name)` (`types/skill.py`, `handlers/skill_reader.py`).
+- `handlers/cli_introspection.py` — click command-tree walking (`list_commands`) and installed-console-script reverse lookup (`find_installed_packages_for_commands`).
+- `handlers/section_generator.py` — `discover_cli_packages` (deterministic) plus `generate_missing_sections` (OpenAI-backed, isolated behind `_call_openai` so tests never make a real API call), including the ambient-tooling denylist and markdown-JSON-fence stripping (some models wrap a JSON response in `` ```json ``  fences even with `response_format={"type": "json_object"}` requested — found live against Ollama Cloud's `glm-5.2`).
+- `handlers/reference_pull.py` — `pull_reference_files`, containment-checked against both the skill directory and the repo root.
+- Two local sidecars, both dotfiles in the per-version cache, both excluded from `content_checksum`, both carried across `promoteSkillVersion`/`rollbackSkill` by `install_from_cache`: `.hsk-generated.json` (human/agent-facing — what got generated) and `.hsk-checksum-exclusions.json` (internal-only — which `reference_files` paths were pulled in and so must be excluded from the checksum; split out after Known issue #7 to keep the human-facing sidecar free of bookkeeping nobody needs to read).
+- `Config.OPENAI_API_KEY`/`OPENAI_BASE_URL`/`HSK_OPENAI_MODEL` (default `gpt-4o-mini`) — `OPENAI_API_KEY`/`OPENAI_BASE_URL` are the same shared, non-`HSK_`-prefixed settings other engines in this gateway already use for their own OpenAI calls.
+- Regenerates on every deploy of a skill leaving these fields absent; the existing redeploy-skip path (unchanged commit) still avoids it entirely since it never clones at all.
 
-Exit criteria:
+Exit criteria (met):
 
-- A skill with `cli_packages` declared and `allowed_commands`/`reference_files` omitted gets both fields populated in its `skill(name)` response after deploy, sourced from the sidecar, with `SKILL.md` itself unchanged.
-- A skill that already declares `allowed_commands`/`reference_files` explicitly is deployed with no OpenAI call made at all.
-- An OpenAI failure during deploy still results in a successful deploy, with the affected field(s) simply absent.
-- Covered by tests with the OpenAI call mocked — no live API dependency in CI.
+- A skill with `cli_packages` declared (or discoverable) and `allowed_commands`/`reference_files` omitted gets those fields populated in its `skill(name)` response after deploy, sourced from the sidecar, with `SKILL.md` itself unchanged. Verified live against `git@github.com:ideabosque/multilingual_slide_video_production_system.git` (7 skills) and `git@github.com:ideabosque/autonomous-integration-testing-specialist.git` (1 skill, entirely native reference material — no repo-wide pull-in needed).
+- A skill that already declares all three fields explicitly is deployed with no OpenAI call and no generation of any kind.
+- An OpenAI failure/malformed response during deploy still results in a successful deploy, with the affected field(s) simply absent — never a partial or malformed `allowed_commands`.
+- A pulled-in `reference_files` entry never causes a false `stale_index`/checksum-mismatch on the very next read (Known issue #7).
+- No ambient-tooling false positive (e.g. `pip`) ever appears in a generated `cli_packages` list; no `docs`/`tests`/`README.md` file ever appears in a generated `reference_files` list.
+- Covered by tests with the OpenAI call mocked throughout — no live API dependency in CI — plus the live gateway verification above for the parts a mock can't prove (real console-script lookup, real repo cloning, real checksum round-trip).
 
 ---
 
@@ -1171,6 +1206,7 @@ Minimum test coverage for v1:
 | Command executor | Allowlisted argv accepted, unmatched argv rejected, shell syntax rejected, kill switch, glob match, dry run. | Partial (`test_command_executor.py`) - path traversal, timeout, and output-cap cases still missing |
 | Deployment | Git-based deploy against real local git repos: first-version auto-activation, promote-gating for later versions, redeploy-skip on an unchanged commit. There is no ZIP path to test — `deploySkillPackage` only accepts git. | Done (`test_skill_deployment.py`, `test_integration.py::TestDeploySkillPackage`) |
 | Discovery + CLI package auto-install | `SKILL.md` nested several directories deep is still discovered; a declared `cli_packages` entry is auto-registered and installed at deploy time; an install failure fails only that skill (`failed`, no DB row written); a skill with no `cli_packages` never touches the CLI package manager. | Done (`test_skill_deployment.py::TestDeploySkillPackageDiscoveryAndCliPackages`) |
+| P9 section generation | `cli_packages` discovery (real console-script matching, ambient-tooling denylist), `allowed_commands`/`reference_files` OpenAI-backed generation (mocked call, missing-key/failure/malformed-response degrade gracefully, markdown-fence stripping), declared-vs-generated precedence, repo-wide candidate widening + pull-in, `docs`/`tests`/`README.md`/`SKILL.md` exclusion, and the two sidecars' checksum-exemption + promote carry-over. | Done (`test_section_generator.py`, `test_cli_introspection.py`, `test_reference_pull.py`, `test_skill_reader.py`, `test_skill_version_cache.py`, `test_skill_deployment.py::TestDeploySkillPackageSectionGeneration`/`TestDeploySkillPackageReferenceFilePull`/`TestListAvailableFiles`) plus live verification against two real repos (see §14 P9) |
 | Local refresh | On-demand git refresh of a stale/missing local cache, verified end to end (including a live smoke test against a real GitHub repo, both HTTPS and SSH). | Done (`test_integration.py::TestOnDemandRefresh`) |
 | On-demand refresh | `skill(name)` compares local metadata with the active registration row, fetches from git when needed, and returns the refreshed body. | Done (`test_integration.py::TestOnDemandRefresh`) |
 | Rollback | `promoteSkillVersion`/`rollbackSkill` only change active registration state and swap local disk from the version cache; subsequent `skill(name)` picks up the selected version. | Done (`test_integration.py::TestPromoteRollback`) |
