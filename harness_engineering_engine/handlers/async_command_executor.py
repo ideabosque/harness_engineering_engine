@@ -24,10 +24,7 @@ import subprocess
 import tempfile
 import threading
 import uuid
-from pathlib import Path
 from typing import Any, Dict, Optional
-
-from .config import Config
 
 
 # ---------------------------------------------------------------------------
@@ -147,18 +144,18 @@ def _background_runner(
     timed_out = False
 
     try:
-        stdout_fd = os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-        stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+        # Popen was created with its own stdout/stderr fds (opened in
+        # launch_background_command) — the child writes through those
+        # directly, so this thread only needs to wait on it. Do not
+        # reopen stdout_path/stderr_path here: an O_TRUNC open on files
+        # the child may already be writing to would race its output,
+        # silently dropping whatever it had written so far.
         try:
-            # Popen was created with these fds; we just wait.
             process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
             process.kill()
             process.wait(timeout=5)
-        finally:
-            os.close(stdout_fd)
-            os.close(stderr_fd)
 
         exit_code = process.returncode
     except Exception as e:
@@ -259,7 +256,6 @@ def launch_background_command(
     )
 
     # Start background thread to wait for completion
-    entry = get_run(run_id)
     thread = threading.Thread(
         target=_background_runner,
         args=(

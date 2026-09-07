@@ -161,7 +161,6 @@ class PromoteSkillVersion(Mutation):
             from ..models.repositories import get_repo
 
             repo = get_repo("skill")
-            partition_key = info.context.get("partition_key")
 
             # Deactivate all versions for this skill
             rows = repo.list(info, name=kwargs["name"], enabled=True)
@@ -389,9 +388,6 @@ class RunCommand(Mutation):
         match, shell-metacharacter rejection, CLI package ensure) but launches
         the actual subprocess detached instead of blocking on it.
         """
-        import os
-        import shlex
-
         from ..handlers.async_command_executor import launch_background_command
         from ..handlers.command_executor import (
             _normalize_argv,
