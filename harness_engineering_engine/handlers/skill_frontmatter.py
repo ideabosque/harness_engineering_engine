@@ -46,6 +46,15 @@ def parse_frontmatter(text: str) -> ParsedSkill:
     Raises ``ValueError`` when the frontmatter block is missing, malformed, or
     required fields are absent.
     """
+    # A UTF-8 BOM (U+FEFF) at the very start of the file is common from
+    # editors/tools that default to "UTF-8 with BOM" — strip it before
+    # matching, since the frontmatter regex requires the file to start
+    # with "---" literally. Real-world case: every SKILL.md in a repo
+    # saved with a BOM failed with "does not contain a YAML frontmatter
+    # block" even though the file visually looked correct.
+    if text.startswith("﻿"):
+        text = text[1:]
+
     match = _FRONTMATTER_RE.match(text)
     if not match:
         raise ValueError("SKILL.md does not contain a YAML frontmatter block.")

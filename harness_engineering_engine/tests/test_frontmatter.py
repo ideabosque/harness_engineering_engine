@@ -137,6 +137,17 @@ Body.
         assert "allowed_commands" in explicit_empty.raw_frontmatter
         assert "allowed_commands" not in absent.raw_frontmatter
 
+    def test_leading_utf8_bom_is_stripped(self):
+        """Some editors/tools default to 'UTF-8 with BOM' — a leading
+        U+FEFF must not make an otherwise-valid SKILL.md look frontmatter-
+        less. Found live: every SKILL.md in a real repo saved this way
+        failed to deploy with "does not contain a YAML frontmatter block"
+        even though the file was visually correct."""
+        text = "﻿---\nname: bom-test\ndescription: Has a BOM.\n---\n\nBody.\n"
+        result = parse_frontmatter(text)
+        assert result.frontmatter.name == "bom-test"
+        assert result.body == "Body."
+
     def test_body_is_stripped(self):
         text = """---
 name: strip-test
