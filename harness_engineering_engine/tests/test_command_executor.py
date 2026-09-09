@@ -4,6 +4,7 @@
 from __future__ import print_function
 
 import logging
+import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -138,6 +139,73 @@ class TestCommandExecutor:
                         assert result["exit_code"] == 0
                         assert result["timed_out"] is False
                         assert isinstance(result["truncated"], bool)
+
+    def test_none_subprocess_output_is_normalized(self):
+        """Treat missing stdout/stderr from subprocess as empty strings."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._write_skill(root, "test-skill")
+
+            with self._mock_config(td):
+                with patch(
+                    "harness_engineering_engine.handlers.command_executor._get_skill"
+                ) as mock_get:
+                    mock_get.return_value = {
+                        "allowed_commands": [{"argv": ["ioa", "research", "summary"]}],
+                    }
+                    with patch(
+                        "harness_engineering_engine.handlers.command_executor.resolve_skill_root"
+                    ) as mock_root:
+                        mock_root.return_value = root
+                        with patch(
+                            "harness_engineering_engine.handlers.command_executor.subprocess.run"
+                        ) as mock_run:
+                            mock_run.return_value = MagicMock(
+                                stdout=None,
+                                stderr=None,
+                                returncode=0,
+                            )
+
+                            result = execute_command(
+                                FakeInfo(), "test-skill", ["ioa", "research", "summary"]
+                            )
+
+                            assert result["stdout"] == ""
+                            assert result["stderr"] == ""
+                            assert result["exit_code"] == 0
+                            assert result["truncated"] is False
+
+    def test_utf8_subprocess_output_is_decoded(self):
+        """Decode UTF-8 CLI output consistently on Windows hosts."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill_dir = self._write_skill(root, "test-skill")
+            script = skill_dir / "emit_utf8.py"
+            script.write_text(
+                "import sys\nsys.stdout.buffer.write('Vitamin C — Market Summary'.encode('utf-8'))\n",
+                encoding="utf-8",
+            )
+
+            with self._mock_config(td):
+                with patch(
+                    "harness_engineering_engine.handlers.command_executor._get_skill"
+                ) as mock_get:
+                    mock_get.return_value = {
+                        "allowed_commands": [{"argv": [sys.executable, "emit_utf8.py"]}],
+                    }
+                    with patch(
+                        "harness_engineering_engine.handlers.command_executor.resolve_skill_root"
+                    ) as mock_root:
+                        mock_root.return_value = root
+
+                        result = execute_command(
+                            FakeInfo(), "test-skill", [sys.executable, "emit_utf8.py"]
+                        )
+
+                        assert result["stdout"] == "Vitamin C — Market Summary"
+                        assert result["stderr"] == ""
+                        assert result["exit_code"] == 0
+                        assert result["truncated"] is False
 
     def test_glob_allowlist_match(self):
         """Verify that glob patterns in allowed_commands match actual argv."""

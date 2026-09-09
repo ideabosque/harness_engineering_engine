@@ -34,6 +34,7 @@ __author__ = "bibow"
 import json
 import logging
 import re
+import shlex
 from typing import Any, Dict, List, Set
 
 from . import cli_introspection
@@ -72,6 +73,10 @@ reference_files is a list of path strings."""
 # cli_introspection.find_installed_packages_for_commands) — a false
 # positive here just means "no match found," never an invented package.
 _BACKTICK_RE = re.compile(r"`([^`]+)`")
+_FENCED_CODE_RE = re.compile(
+    r"```(?:[A-Za-z0-9_-]+)?[ \t]*\n(.*?)\n?```",
+    re.DOTALL,
+)
 
 # Ambient developer/environment tooling — near-universally installed, and
 # routinely mentioned in a skill's body as a setup/prerequisite aside
@@ -85,29 +90,154 @@ _AMBIENT_TOOLING_DENYLIST = {
     "pip", "pip3", "python", "python3", "git", "npm", "npx", "yarn", "pnpm",
     "node", "docker", "docker-compose", "make", "cargo", "go", "cmake",
     "conda", "poetry", "pipenv", "virtualenv", "brew", "apt", "apt-get",
-    "curl", "wget", "sh", "bash",
+    "curl", "wget", "sh", "bash", "source", "cd", "export", "env",
 }
+_CONSOLE_SCRIPT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
+
+
+def _valid_candidate_token(token: str) -> bool:
+    if not token or "/" in token or "\\" in token:
+        return False
+    if not _CONSOLE_SCRIPT_NAME_RE.match(token):
+        return False
+    if token.startswith(("-", "$", ".")):
+        return False
+    if token in _AMBIENT_TOOLING_DENYLIST:
+        return False
+    return True
+
+
+def _first_command_token(line: str) -> str:
+    """Return the command token from a shell-like example line.
+
+    This intentionally does not try to interpret shell syntax. It only
+    handles the common documentation shape used in SKILL.md command blocks:
+    optional prompts, optional environment assignments, then a command.
+    """
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return ""
+
+    while stripped.startswith(("$", ">")):
+        stripped = stripped[1:].strip()
+
+    try:
+        parts = shlex.split(stripped, posix=True)
+    except ValueError:
+        parts = stripped.split()
+
+    while parts and "=" in parts[0] and not parts[0].startswith("-"):
+        key, _, _value = parts[0].partition("=")
+        if not key.replace("_", "").isalnum():
+            break
+        parts = parts[1:]
+
+    return parts[0] if parts else ""
+
+
+def _shell_example_argv(line: str) -> List[str]:
+    """Parse one documented shell command line into argv-ish tokens.
+
+    Optional bracket notation like ``[--repo PATH]`` is documentation, not
+    part of argv, so it is dropped. Dynamic values for common IOA options are
+    globbed so command_executor can still match real user inputs safely.
+    """
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return []
+
+    while stripped.startswith(("$", ">")):
+        stripped = stripped[1:].strip()
+
+    try:
+        parts = shlex.split(stripped, posix=True)
+    except ValueError:
+        parts = stripped.split()
+
+    while parts and "=" in parts[0] and not parts[0].startswith("-"):
+        key, _, _value = parts[0].partition("=")
+        if not key.replace("_", "").isalnum():
+            break
+        parts = parts[1:]
+
+    filtered: List[str] = []
+    in_optional = False
+    for part in parts:
+        if part.startswith("["):
+            in_optional = True
+        if not in_optional:
+            filtered.append(part)
+        if in_optional and part.endswith("]"):
+            in_optional = False
+
+    wildcard_value_options = {"--ingredient", "--repo", "--date"}
+    for idx, part in enumerate(filtered[:-1]):
+        if part in wildcard_value_options:
+            filtered[idx + 1] = "*"
+
+    return filtered
 
 
 def _extract_candidate_commands(body: str) -> List[str]:
     candidates: List[str] = []
     seen: Set[str] = set()
-    for match in _BACKTICK_RE.finditer(body):
+
+    def add_candidate(token: str) -> None:
+        if not _valid_candidate_token(token):
+            return
+        if token in seen:
+            return
+        seen.add(token)
+        candidates.append(token)
+
+    for match in _FENCED_CODE_RE.finditer(body):
+        for line in match.group(1).splitlines():
+            add_candidate(_first_command_token(line))
+
+    inline_body = _FENCED_CODE_RE.sub("", body)
+    for match in _BACKTICK_RE.finditer(inline_body):
         text = match.group(1).strip()
         if not text:
             continue
         first_token = text.split()[0]
-        if not first_token or "/" in first_token or "\\" in first_token:
-            continue
-        if first_token.startswith(("-", "$", ".")):
-            continue
-        if first_token in _AMBIENT_TOOLING_DENYLIST:
-            continue
-        if first_token in seen:
-            continue
-        seen.add(first_token)
-        candidates.append(first_token)
+        add_candidate(first_token)
     return candidates
+
+
+def _derive_allowed_commands_from_examples(
+    body: str,
+    commands_by_package: Dict[str, List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Build allowlist entries from fenced command examples.
+
+    A derived entry is accepted only when its argv starts with a real
+    introspected leaf command. This keeps the convenience deterministic while
+    preserving the deny-by-default model.
+    """
+    command_prefixes = [
+        entry.get("argv", [])
+        for commands in commands_by_package.values()
+        for entry in commands
+        if isinstance(entry.get("argv"), list)
+    ]
+    if not command_prefixes:
+        return []
+
+    allowed: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for match in _FENCED_CODE_RE.finditer(body):
+        for line in match.group(1).splitlines():
+            argv = _shell_example_argv(line)
+            if not argv:
+                continue
+            if not any(argv[: len(prefix)] == prefix for prefix in command_prefixes):
+                continue
+            key = json.dumps(argv, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            allowed.append({"argv": argv})
+    return allowed
 
 
 _JSON_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL)
@@ -260,6 +390,16 @@ def generate_missing_sections(
         openai_fields = openai_fields - {"allowed_commands"}
         if not openai_fields:
             return result
+
+    if "allowed_commands" in openai_fields:
+        derived_allowed_commands = _derive_allowed_commands_from_examples(
+            body, commands_by_package
+        )
+        if derived_allowed_commands:
+            result["allowed_commands"] = derived_allowed_commands
+            openai_fields = openai_fields - {"allowed_commands"}
+            if not openai_fields:
+                return result
 
     user_prompt = _build_user_prompt(
         skill_name, description, body, commands_by_package, available_files, openai_fields

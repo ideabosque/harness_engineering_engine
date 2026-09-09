@@ -224,11 +224,13 @@ def execute_command(
             cwd=str(skill_dir),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout_seconds,
             shell=False,  # never use a shell
         )
-        stdout = result.stdout
-        stderr = result.stderr
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
 
         stdout_len = len(stdout.encode("utf-8"))
         stderr_len = len(stderr.encode("utf-8"))

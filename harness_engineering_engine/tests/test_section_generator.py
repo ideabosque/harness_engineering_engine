@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 from harness_engineering_engine.handlers.config import Config
 from harness_engineering_engine.handlers.section_generator import (
+    _derive_allowed_commands_from_examples,
     _discover_cli_packages,
     _extract_candidate_commands,
     _strip_json_fence,
@@ -248,6 +249,25 @@ class TestExtractCandidateCommands:
     def test_no_backticks_yields_nothing(self):
         assert _extract_candidate_commands("Plain prose, no code spans.") == []
 
+    def test_extracts_first_token_from_fenced_command_blocks(self):
+        body = """Read back research with:
+
+```bash
+ioa research summary --ingredient "Vitamin C" --repo /tmp/research
+ioa research news --category commodity_pricing
+```
+"""
+        assert _extract_candidate_commands(body) == ["ioa"]
+
+    def test_fenced_blocks_support_prompts_and_env_assignments(self):
+        body = """```bash
+$ IOA_RESEARCH_REPO=/tmp/research ioa research cross-ingredient
+> pytest --collect-only
+# comment
+```
+"""
+        assert _extract_candidate_commands(body) == ["ioa", "pytest"]
+
 
 class TestDiscoverCliPackages:
     def test_discovers_a_really_installed_command_mentioned_in_body(self):
@@ -264,9 +284,66 @@ class TestDiscoverCliPackages:
             # read from real installed metadata.
             assert set(entry.keys()) == {"package_name", "version"}
 
+    def test_discovers_installed_command_mentioned_only_in_fenced_block(self):
+        body = """Run the test CLI from a documented shell block.
+
+```bash
+pytest --collect-only
+```
+"""
+        result = _discover_cli_packages(body)
+
+        names = {entry["package_name"].lower() for entry in result}
+        assert "pytest" in names
+
     def test_no_real_command_mentioned_yields_nothing(self):
         body = "This skill just reasons about text, no CLI involved."
         assert _discover_cli_packages(body) == []
+
+
+class TestDeriveAllowedCommandsFromExamples:
+    def test_derives_ioa_research_command_with_wildcard_ingredient(self):
+        body = """```bash
+ioa research summary --ingredient "Vitamin C" [--repo PATH]
+```
+"""
+        commands_by_package = {
+            "ingredient-optimization-agent": [
+                {"argv": ["ioa", "research", "summary"], "note": ""},
+            ]
+        }
+
+        assert _derive_allowed_commands_from_examples(body, commands_by_package) == [
+            {"argv": ["ioa", "research", "summary", "--ingredient", "*"]}
+        ]
+
+    def test_keeps_enum_values_and_drops_optional_bracket_groups(self):
+        body = """```bash
+ioa research news --category commodity_pricing [--repo PATH]
+```
+"""
+        commands_by_package = {
+            "ingredient-optimization-agent": [
+                {"argv": ["ioa", "research", "news"], "note": ""},
+            ]
+        }
+
+        assert _derive_allowed_commands_from_examples(body, commands_by_package) == [
+            {"argv": ["ioa", "research", "news", "--category", "commodity_pricing"]}
+        ]
+
+    def test_ignores_examples_without_real_command_prefix(self):
+        body = """```bash
+ioa research summary --ingredient "Vitamin C"
+```
+"""
+        commands_by_package = {
+            "other-package": [
+                {"argv": ["other", "command"], "note": ""},
+            ]
+        }
+
+        assert _derive_allowed_commands_from_examples(body, commands_by_package) == []
 
 
 class TestGenerateMissingSectionsCliPackagesDiscovery:
@@ -338,3 +415,25 @@ class TestGenerateMissingSectionsCliPackagesDiscovery:
         assert "pytest" in called_package_names
         assert result["allowed_commands"] == [{"argv": ["pytest", "--collect-only"]}]
         assert any(e["package_name"].lower() == "pytest" for e in result["cli_packages"])
+
+    def test_fenced_examples_generate_allowed_commands_without_openai(self):
+        body = """```bash
+pytest --collect-only
+```
+"""
+
+        with patch(
+            "harness_engineering_engine.handlers.cli_introspection.list_commands",
+            return_value=[
+                {"argv": ["pytest"], "note": "Run pytest."},
+            ],
+        ), patch(
+            "harness_engineering_engine.handlers.section_generator._call_openai"
+        ) as mock_call:
+            result = generate_missing_sections(
+                logger, "skill", "desc", body,
+                [], [], {"allowed_commands", "cli_packages"},
+            )
+
+        mock_call.assert_not_called()
+        assert result["allowed_commands"] == [{"argv": ["pytest", "--collect-only"]}]
