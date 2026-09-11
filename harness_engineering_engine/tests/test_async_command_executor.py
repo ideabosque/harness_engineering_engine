@@ -20,6 +20,8 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 # Ensure the package is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -218,6 +220,102 @@ class TestLaunchAndPollBackgroundCommand(unittest.TestCase):
         self.assertTrue(poll_result["truncated"])
         # Truncated output should be at most limit/2 = 100 chars
         self.assertLessEqual(len(poll_result["stdout"]), 100)
+
+
+class FakeInfo:
+    """Minimal GraphQL-context stand-in, same shape used by test_cli_package.py."""
+
+    def __init__(self, partition_key="hsk-itest#p1"):
+        self.context = {
+            "logger": __import__("logging").getLogger(),
+            "partition_key": partition_key,
+            "endpoint_id": "hsk-itest",
+            "part_id": "p1",
+        }
+
+
+class TestDBBackedCrossInstancePoll:
+    """§18 G-6: poll_command(info=...) must still work after the local entry is gone.
+
+    Simulates a poll landing on a different gateway instance than the one that
+    launched the run by deleting the process-local registry entry (as if this
+    were a fresh process) and confirming poll_command falls back to the
+    DB-backed command_run registry instead of returning not_found.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _itest(self):
+        import logging
+
+        from harness_engineering_engine.handlers.config import Config
+        from harness_engineering_engine.tests import conftest as _conftest
+
+        Config._initialized = False
+        Config.DB_BACKEND = "dynamodb"
+        Config.initialize(logging.getLogger(), _conftest.build_setting_from_env())
+        yield
+        Config.db_session.remove()
+
+    def test_poll_falls_back_to_db_after_local_entry_is_evicted(self):
+        logger = __import__("logging").getLogger()
+        info = FakeInfo()
+
+        argv = [sys.executable, "-c", "print('hello from db-backed run')"]
+        result = launch_background_command(
+            logger=logger,
+            skill_name="test_skill",
+            argv=argv,
+            cwd=os.path.dirname(sys.executable),
+            timeout_seconds=10,
+            output_limit=20000,
+            info=info,
+        )
+        run_id = result["run_id"]
+
+        # Wait for the background thread to finish and mirror completion to the DB.
+        for _ in range(50):
+            local = get_run(run_id)
+            if local is not None and local["status"] != "running":
+                break
+            time.sleep(0.1)
+
+        # Simulate the poll landing on a different instance: no local entry.
+        with _registry_lock:
+            _registry.pop(run_id, None)
+
+        assert get_run(run_id) is None
+
+        poll_result = poll_command(run_id, logger, info=info)
+        assert poll_result["status"] == "completed"
+        assert "hello from db-backed run" in poll_result["stdout"]
+        assert poll_result["exit_code"] == "0"
+
+    def test_poll_without_info_still_not_found_once_local_entry_is_gone(self):
+        """Without info, there is no DB fallback — behavior is unchanged from pre-G-6."""
+        logger = __import__("logging").getLogger()
+
+        argv = [sys.executable, "-c", "print('no db mirroring')"]
+        result = launch_background_command(
+            logger=logger,
+            skill_name="test_skill",
+            argv=argv,
+            cwd=os.path.dirname(sys.executable),
+            timeout_seconds=10,
+            output_limit=20000,
+        )
+        run_id = result["run_id"]
+
+        for _ in range(50):
+            local = get_run(run_id)
+            if local is not None and local["status"] != "running":
+                break
+            time.sleep(0.1)
+
+        with _registry_lock:
+            _registry.pop(run_id, None)
+
+        poll_result = poll_command(run_id, logger)
+        assert poll_result["status"] == "not_found"
 
 
 class TestRunCommandBackgroundDryRun(unittest.TestCase):

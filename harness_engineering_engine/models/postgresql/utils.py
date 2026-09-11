@@ -13,12 +13,15 @@ def initialize_tables(logger: logging.Logger, db_session) -> None:
     from ...utils.rls import create_rls_policies
     from .skill import SkillModel
     from .cli_package import CliPackageModel
+    from .command_run import CommandRunModel
 
     engine = db_session.bind
     SkillModel.__table__.create(engine, checkfirst=True)
     logger.info("PostgreSQL table 'hsk_skills' created (if not present).")
     CliPackageModel.__table__.create(engine, checkfirst=True)
     logger.info("PostgreSQL table 'hsk_cli_packages' created (if not present).")
+    CommandRunModel.__table__.create(engine, checkfirst=True)
+    logger.info("PostgreSQL table 'hsk_command_runs' created (if not present).")
 
     create_rls_policies(engine)
     logger.info("RLS policies applied.")

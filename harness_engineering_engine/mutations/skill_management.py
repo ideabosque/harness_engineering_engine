@@ -514,6 +514,7 @@ class RunCommand(Mutation):
             cwd=str(skill_dir),
             timeout_seconds=timeout_seconds,
             output_limit=output_limit,
+            info=info,
         )
 
         return RunCommand(

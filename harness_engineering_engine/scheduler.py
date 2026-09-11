@@ -5,6 +5,8 @@ This module starts an APScheduler BackgroundScheduler that periodically
 invokes the handler tick functions:
 
 - ``tick_prune_versions`` — disable old skill versions and reclaim local disk
+- ``tick_prune_command_runs`` — delete stale rows from the DB-backed async
+  command run registry (§18 G-6)
 
 Lifecycle:
 - ``start_scheduler()``  — called by the gateway's on_startup hook
@@ -32,6 +34,8 @@ logger = logging.getLogger(__name__)
 _scheduler: Optional[BackgroundScheduler] = None
 
 DEFAULT_PRUNE_INTERVAL = 86400  # 1 day
+DEFAULT_COMMAND_RUN_PRUNE_INTERVAL = 3600  # 1 hour
+DEFAULT_COMMAND_RUN_RETENTION_SECONDS = 3600  # 1 hour, matches the in-memory TTL
 
 def _setting(key: str, default: Any = None) -> Any:
     """Read a setting from Config.get_setting(), with a fallback default."""
@@ -184,6 +188,60 @@ def tick_prune_versions() -> None:
         logger.error(f"tick_prune_versions failed: {exc}")
 
 
+def tick_prune_command_runs() -> None:
+    """Delete completed command_run rows older than the retention window.
+
+    Mirrors the process-local registry's ``_ENTRY_TTL_SECONDS`` sweep in
+    ``handlers/async_command_executor.py`` — a run stays pollable for a
+    while after completion, then is pruned. See §18 G-6.
+    """
+    import pendulum
+
+    from .models.repositories import get_repo
+
+    def run(ctx: Dict[str, Any]) -> None:
+        try:
+            class DummyInfo:
+                def __init__(self, context):
+                    self.context = context
+
+            info = DummyInfo(ctx)
+            repo = get_repo("command_run")
+
+            retention_seconds = int(
+                _setting(
+                    "hsk_scheduler_command_run_retention_seconds",
+                    DEFAULT_COMMAND_RUN_RETENTION_SECONDS,
+                )
+            )
+            cutoff = pendulum.now("UTC").subtract(seconds=retention_seconds)
+
+            stale_rows = repo.list(info, completed_before=cutoff, limit=500)
+            pruned_count = 0
+            for row in stale_rows:
+                repo.delete(
+                    info,
+                    partition_key=row.get("partition_key"),
+                    run_uuid=row.get("run_uuid"),
+                )
+                pruned_count += 1
+
+            if pruned_count > 0:
+                logger.info(
+                    f"tick_prune_command_runs [{ctx.get('partition_key')}]: "
+                    f"pruned {pruned_count} stale command run(s)"
+                )
+        except Exception as e:
+            logger.error(
+                f"Error in tick_prune_command_runs for tenant {ctx.get('partition_key')}: {e}"
+            )
+
+    try:
+        _for_each_tenant(run)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"tick_prune_command_runs failed: {exc}")
+
+
 # ── Lifecycle ─────────────────────────────────────────────────────────────
 
 def start_scheduler() -> None:
@@ -219,6 +277,19 @@ def start_scheduler() -> None:
         name="Prune old skill versions",
     )
 
+    # Prune stale command_run rows (§18 G-6)
+    _scheduler.add_job(
+        tick_prune_command_runs,
+        trigger=IntervalTrigger(
+            seconds=int(_setting(
+                "hsk_scheduler_command_run_prune_interval",
+                DEFAULT_COMMAND_RUN_PRUNE_INTERVAL,
+            ))
+        ),
+        id="tick_prune_command_runs",
+        name="Prune stale command runs",
+    )
+
     _scheduler.start()
 
 
@@ -235,4 +306,5 @@ __all__ = [
     "start_scheduler",
     "stop_scheduler",
     "tick_prune_versions",
+    "tick_prune_command_runs",
 ]

@@ -8,6 +8,7 @@ import logging
 
 from .skill import SkillModel
 from .cli_package import CliPackageModel
+from .command_run import CommandRunModel
 
 
 def initialize_tables(logger: logging.Logger) -> None:
@@ -19,4 +20,7 @@ def initialize_tables(logger: logging.Logger) -> None:
     if not CliPackageModel.exists():
         CliPackageModel.create_table(wait=True, billing_mode="PAY_PER_REQUEST")
         logger.info("Table 'hsk-cli-packages' created.")
+    if not CommandRunModel.exists():
+        CommandRunModel.create_table(wait=True, billing_mode="PAY_PER_REQUEST")
+        logger.info("Table 'hsk-command-runs' created.")
     logger.info("DynamoDB tables initialized.")

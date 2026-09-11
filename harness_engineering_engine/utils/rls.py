@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 _RLS_TABLES = [
     "skills",
     "cli_packages",
+    "command_runs",
 ]
 
 

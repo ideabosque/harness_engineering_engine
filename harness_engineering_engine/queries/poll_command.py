@@ -34,5 +34,5 @@ def resolve_poll_command(info: ResolveInfo, **kwargs: Dict[str, Any]) -> PollCom
             truncated=False,
         )
 
-    result = poll_command(run_id, logger)
+    result = poll_command(run_id, logger, info=info)
     return PollCommandType(**result)

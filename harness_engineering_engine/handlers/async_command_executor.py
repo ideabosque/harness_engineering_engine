@@ -8,16 +8,32 @@ and polled via the ``pollCommand(run_id)`` query.
 This mirrors the async-tool pattern already proven in ``mcp_daemon_engine``'s
 ``async_execute_tool_function``: launch → return a handle → poll for status.
 
-The registry is process-local (in-memory dict). This is intentional for v1:
-the engine runs as a single process (gateway dispatch), and cross-instance
-polling would require a shared store (Redis/DynamoDB) that the current
-architecture doesn't have. If horizontal scaling is needed, the registry
-can be backed by DynamoDB or Redis without changing the public API.
+The process registry (``_registry``) is process-local (in-memory dict) and the
+``subprocess.Popen`` handle it holds can only ever be waited on by the gateway
+instance that launched it — that part does not change with a load balancer in
+front of multiple instances.
+
+What *does* change: when an ``info`` (GraphQL ``ResolveInfo``) is supplied,
+launch and every status change are also mirrored to the ``command_run``
+entity (``models/{postgresql,dynamodb}/command_run.py``, dispatched via
+``get_repo("command_run")``). That makes ``poll_command`` correct from *any*
+instance — not just the one that launched the run — by falling back to a DB
+read when the local dict has no entry. See ``docs/DEVELOPMENT_PLAN.md`` §18
+G-6 for the full design and its explicit non-goals (an instance dying
+mid-run still orphans that run; this does not add a resumable job queue).
+
+Callers that omit ``info`` (the existing unit tests, or any internal caller
+that doesn't have GraphQL context) get the original process-local-only
+behavior unchanged — DB mirroring is strictly additive and best-effort: a
+failed DB write is logged and swallowed rather than failing the run, since
+the OS process and the local registry are still the source of truth for the
+launching instance.
 """
 from __future__ import print_function
 
 __author__ = "bibow"
 
+import json
 import logging
 import os
 import subprocess
@@ -36,6 +52,10 @@ _registry: Dict[str, Dict[str, Any]] = {}
 
 # Cleanup completed entries after this many seconds to bound memory.
 _ENTRY_TTL_SECONDS = 3600  # 1 hour
+
+# How often the background thread checks on the process and (when DB
+# mirroring is active) writes partial output — not just once at exit.
+_DB_PROGRESS_INTERVAL_SECONDS = 3
 
 
 def _register(
@@ -119,6 +139,120 @@ def _cleanup_stale_entries() -> None:
 
 
 # ---------------------------------------------------------------------------
+# DB mirroring — best-effort, only when the caller supplied ``info``
+# ---------------------------------------------------------------------------
+
+
+def _db_insert_launch(
+    info: Any, run_id: str, skill_name: str, argv: list, logger: logging.Logger
+) -> None:
+    try:
+        import pendulum
+
+        from ..models.repositories.dispatch import get_repo
+
+        get_repo("command_run").insert_update(
+            info,
+            run_uuid=run_id,
+            skill_name=skill_name,
+            argv=json.dumps(argv),
+            status="running",
+            started_at=pendulum.now("UTC"),
+            updated_by="run_command",
+        )
+    except Exception:
+        logger.warning(
+            f"command_run: failed to write launch row for run_id={run_id}",
+            exc_info=True,
+        )
+
+
+def _db_write_progress(
+    info: Any, run_id: str, stdout_content: str, stderr_content: str, logger: logging.Logger
+) -> None:
+    try:
+        from ..models.repositories.dispatch import get_repo
+
+        get_repo("command_run").insert_update(
+            info,
+            run_uuid=run_id,
+            stdout=stdout_content,
+            stderr=stderr_content,
+            updated_by="run_command",
+        )
+    except Exception:
+        logger.warning(
+            f"command_run: failed to write progress for run_id={run_id}",
+            exc_info=True,
+        )
+
+
+def _db_write_final(
+    info: Any,
+    run_id: str,
+    status: str,
+    exit_code: Optional[int],
+    stdout_content: str,
+    stderr_content: str,
+    timed_out: bool,
+    truncated: bool,
+    output_truncated_bytes: int,
+    logger: logging.Logger,
+) -> None:
+    try:
+        import pendulum
+
+        from ..models.repositories.dispatch import get_repo
+
+        get_repo("command_run").insert_update(
+            info,
+            run_uuid=run_id,
+            status=status,
+            exit_code=str(exit_code) if exit_code is not None else None,
+            stdout=stdout_content,
+            stderr=stderr_content,
+            timed_out=timed_out,
+            truncated=truncated,
+            output_truncated_bytes=output_truncated_bytes,
+            completed_at=pendulum.now("UTC"),
+            updated_by="run_command",
+        )
+    except Exception:
+        logger.warning(
+            f"command_run: failed to write completion for run_id={run_id}",
+            exc_info=True,
+        )
+
+
+def _poll_from_db(run_id: str, info: Any, logger: logging.Logger) -> Optional[Dict[str, Any]]:
+    """Fall back to the DB-backed registry for a run this instance didn't launch."""
+    try:
+        partition_key = info.context.get("partition_key")
+        if not partition_key:
+            return None
+
+        from ..models.repositories.dispatch import get_repo
+
+        row = get_repo("command_run").get(partition_key=partition_key, run_uuid=run_id)
+        if row is None:
+            return None
+
+        return {
+            "run_id": run_id,
+            "status": row.get("status") or "running",
+            "stdout": row.get("stdout") or "",
+            "stderr": row.get("stderr") or "",
+            "exit_code": row.get("exit_code"),
+            "timed_out": bool(row.get("timed_out", False)),
+            "truncated": bool(row.get("truncated", False)),
+            "output_truncated_bytes": row.get("output_truncated_bytes", 0) or 0,
+        }
+    except Exception:
+        logger.warning(f"command_run: DB fallback poll failed for run_id={run_id}", exc_info=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Background runner — launched in a thread, writes output to temp files
 # ---------------------------------------------------------------------------
 
@@ -132,6 +266,7 @@ def _background_runner(
     timeout_seconds: int,
     output_limit: int,
     logger: logging.Logger,
+    info: Any = None,
 ) -> None:
     """Run the subprocess detached, capture output to files, update registry."""
     import time
@@ -150,12 +285,27 @@ def _background_runner(
         # reopen stdout_path/stderr_path here: an O_TRUNC open on files
         # the child may already be writing to would race its output,
         # silently dropping whatever it had written so far.
-        try:
-            process.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            process.kill()
-            process.wait(timeout=5)
+        #
+        # Wait in short intervals rather than one blocking call for the
+        # full timeout, so a DB-mirrored run's row picks up fresh partial
+        # output every few seconds instead of only at exit.
+        elapsed = 0.0
+        while True:
+            wait_for = min(_DB_PROGRESS_INTERVAL_SECONDS, max(timeout_seconds - elapsed, 0.01))
+            try:
+                process.wait(timeout=wait_for)
+                break
+            except subprocess.TimeoutExpired:
+                elapsed += wait_for
+                if elapsed >= timeout_seconds:
+                    timed_out = True
+                    process.kill()
+                    process.wait(timeout=5)
+                    break
+                if info is not None:
+                    stdout_progress, _ = _read_partial(stdout_path, output_limit)
+                    stderr_progress, _ = _read_partial(stderr_path, output_limit)
+                    _db_write_progress(info, run_id, stdout_progress, stderr_progress, logger)
 
         exit_code = process.returncode
     except Exception as e:
@@ -189,14 +339,31 @@ def _background_runner(
             with open(stderr_path, "w", encoding="utf-8") as f:
                 f.write(stderr_content)
 
+        final_status = "timed_out" if timed_out else "completed"
+        truncated = stdout_truncated or stderr_truncated
+
         with _registry_lock:
             if run_id in _registry:
-                _registry[run_id]["status"] = "timed_out" if timed_out else "completed"
+                _registry[run_id]["status"] = final_status
                 _registry[run_id]["exit_code"] = str(exit_code) if exit_code is not None else None
                 _registry[run_id]["timed_out"] = timed_out
-                _registry[run_id]["truncated"] = stdout_truncated or stderr_truncated
+                _registry[run_id]["truncated"] = truncated
                 _registry[run_id]["output_truncated_bytes"] = output_truncated_bytes
                 _registry[run_id]["completed_at"] = time.time()
+
+        if info is not None:
+            _db_write_final(
+                info,
+                run_id,
+                final_status,
+                exit_code,
+                stdout_content,
+                stderr_content,
+                timed_out,
+                truncated,
+                output_truncated_bytes,
+                logger,
+            )
 
     _cleanup_stale_entries()
 
@@ -213,10 +380,15 @@ def launch_background_command(
     cwd: str,
     timeout_seconds: int,
     output_limit: int,
+    info: Any = None,
 ) -> Dict[str, Any]:
     """Launch a command in the background and return a run_id handle.
 
-    The caller polls status via ``poll_command(run_id)``.
+    The caller polls status via ``poll_command(run_id)``. When ``info`` (the
+    GraphQL ``ResolveInfo`` for the launching request) is supplied, the run
+    is also mirrored to the DB-backed ``command_run`` registry so that
+    ``pollCommand`` is answerable from any gateway instance, not only this
+    one — see the module docstring and ``docs/DEVELOPMENT_PLAN.md`` §18 G-6.
     """
     run_id = str(uuid.uuid4())
 
@@ -255,6 +427,9 @@ def launch_background_command(
         output_limit=output_limit,
     )
 
+    if info is not None:
+        _db_insert_launch(info, run_id, skill_name, argv, logger)
+
     # Start background thread to wait for completion
     thread = threading.Thread(
         target=_background_runner,
@@ -267,6 +442,7 @@ def launch_background_command(
             timeout_seconds,
             output_limit,
             logger,
+            info,
         ),
         daemon=True,
     )
@@ -286,8 +462,15 @@ def launch_background_command(
     }
 
 
-def poll_command(run_id: str, logger: logging.Logger) -> Dict[str, Any]:
+def poll_command(run_id: str, logger: logging.Logger, info: Any = None) -> Dict[str, Any]:
     """Poll the status of a background command.
+
+    Checks the process-local registry first (fast path — always correct for
+    the instance that launched the run). If the run is unknown locally and
+    ``info`` is supplied, falls back to a DB read via ``command_run`` so that
+    a poll landing on a *different* gateway instance than the one that
+    launched the run still returns accurate status instead of a spurious
+    ``not_found``. See ``docs/DEVELOPMENT_PLAN.md`` §18 G-6.
 
     Returns:
         - ``status``: "running", "completed", "timed_out", or "not_found"
@@ -298,38 +481,37 @@ def poll_command(run_id: str, logger: logging.Logger) -> Dict[str, Any]:
         - ``truncated``: bool
     """
     entry = get_run(run_id)
-    if entry is None:
+    if entry is not None:
+        status = entry["status"]
+        output_limit = entry["output_limit"]
+
+        stdout_content, _ = _read_partial(entry["stdout_path"], output_limit)
+        stderr_content, _ = _read_partial(entry["stderr_path"], output_limit)
+
         return {
             "run_id": run_id,
-            "status": "not_found",
-            "stdout": "",
-            "stderr": "",
-            "exit_code": None,
-            "timed_out": False,
-            "truncated": False,
+            "status": status,
+            "stdout": stdout_content,
+            "stderr": stderr_content,
+            "exit_code": entry.get("exit_code"),
+            "timed_out": entry.get("timed_out", False),
+            "truncated": entry.get("truncated", False),
+            "output_truncated_bytes": entry.get("output_truncated_bytes", 0),
         }
 
-    status = entry["status"]
-    output_limit = entry["output_limit"]
-
-    if status == "running":
-        # Read partial output from the temp files while the process is still running
-        stdout_content, _ = _read_partial(entry["stdout_path"], output_limit)
-        stderr_content, _ = _read_partial(entry["stderr_path"], output_limit)
-    else:
-        # Completed — output files already truncated by the background runner
-        stdout_content, _ = _read_partial(entry["stdout_path"], output_limit)
-        stderr_content, _ = _read_partial(entry["stderr_path"], output_limit)
+    if info is not None:
+        db_result = _poll_from_db(run_id, info, logger)
+        if db_result is not None:
+            return db_result
 
     return {
         "run_id": run_id,
-        "status": status,
-        "stdout": stdout_content,
-        "stderr": stderr_content,
-        "exit_code": entry.get("exit_code"),
-        "timed_out": entry.get("timed_out", False),
-        "truncated": entry.get("truncated", False),
-        "output_truncated_bytes": entry.get("output_truncated_bytes", 0),
+        "status": "not_found",
+        "stdout": "",
+        "stderr": "",
+        "exit_code": None,
+        "timed_out": False,
+        "truncated": False,
     }
 
 
