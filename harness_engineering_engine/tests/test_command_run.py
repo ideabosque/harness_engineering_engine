@@ -12,6 +12,7 @@ real test database configured in ``tests/.env`` — the same pattern used by
   - list(completed_before=...) finds stale completed rows for cleanup
   - delete removes a row
   - scheduler.tick_prune_command_runs prunes only rows past retention
+  - RLS: a row inserted under one tenant is invisible under another
 """
 from __future__ import print_function
 
@@ -164,6 +165,38 @@ class TestCommandRunRepository:
 
         assert repo.delete(FakeInfo(), partition_key="hsk-itest#p1", run_uuid=run_id) is True
         assert repo.get(partition_key="hsk-itest#p1", run_uuid=run_id) is None
+
+
+class TestCommandRunCrossTenantIsolation:
+    def test_row_invisible_under_a_different_tenant(self, itest):
+        """A command_run row inserted for tenant A is invisible under tenant B.
+
+        Asserted at the repository boundary — every ``command_run`` repo
+        method filters explicitly on ``partition_key`` (see
+        ``command_run_repo.py``), the same application-level isolation used
+        by every other entity here. This does *not* prove DB-level RLS is
+        enforced: this test environment's DB role is a Postgres superuser
+        (verified separately), and superusers always bypass RLS regardless
+        of ``FORCE ROW LEVEL SECURITY`` — a pre-existing property of every
+        RLS-protected table here, not specific to command_run. Production
+        must connect as a non-superuser role for the RLS policy in
+        ``utils/rls.py`` to be a real defense-in-depth layer rather than a
+        no-op.
+        """
+        run_id = str(uuid.uuid4())
+        repo = get_repo("command_run")
+        repo.insert_update(
+            FakeInfo("hsk-itest#p1"),
+            run_uuid=run_id,
+            skill_name="demand-forecasting",
+            argv=json.dumps(["python", "run.py"]),
+            status="running",
+            started_at=pendulum.now("UTC"),
+            updated_by="itest",
+        )
+
+        assert repo.get(partition_key="hsk-itest#p1", run_uuid=run_id) is not None
+        assert repo.get(partition_key="other-tenant#p2", run_uuid=run_id) is None
 
 
 class TestPruneCommandRunsScheduler:

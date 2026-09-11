@@ -683,3 +683,95 @@ class TestINT012OutputTruncation:
         stdout_len = len(data["stdout"].encode("utf-8"))
         assert stdout_len <= Config.RUN_COMMAND_OUTPUT_LIMIT_BYTES, \
             f"stdout {stdout_len}B exceeds limit {Config.RUN_COMMAND_OUTPUT_LIMIT_BYTES}B"
+
+
+# ---------------------------------------------------------------------------
+# INT-013 — pollCommand survives a "different instance" (§18 G-6)
+# ---------------------------------------------------------------------------
+
+class TestINT013CrossInstancePoll:
+    """End-to-end (real GraphQL dispatch, real Postgres) proof of §18 G-6.
+
+    Launches a background command through the actual ``runCommand`` mutation
+    (not a handler call with a fake context), confirms the run was mirrored
+    to ``hsk_command_runs``, then simulates the poll landing on a *different*
+    gateway instance by evicting the process-local registry entry — the only
+    thing that is genuinely process-local and therefore the only thing a
+    second process wouldn't have. ``pollCommand`` must still resolve the
+    correct final status/output/exit_code from the DB instead of `not_found`.
+    """
+
+    def test_poll_after_local_registry_eviction_falls_back_to_db(self, itest):
+        from harness_engineering_engine.handlers.async_command_executor import (
+            _registry,
+            _registry_lock,
+        )
+        from harness_engineering_engine.models.repositories import get_repo
+
+        tmp = itest["tmp"]
+        body = "Cross-instance poll test skill."
+        script = tmp / "cross_instance_script.py"
+        script.write_text("print('cross-instance output')\n")
+        remote = _make_git_skill_repo(
+            tmp, "cross-instance-skill", body,
+            allowed_commands=[["python", str(script)]],
+        )
+        _deploy_skill(itest, remote, "cross-instance-skill")
+
+        launch_data = _gql(
+            """
+            mutation RunCmd($name: String!, $argv: [String!]!, $background: Boolean) {
+                runCommand(name: $name, argv: $argv, background: $background) {
+                    runId
+                }
+            }
+            """,
+            itest,
+            {"name": "cross-instance-skill", "argv": ["python", str(script)],
+             "background": True},
+        )["runCommand"]
+        run_id = launch_data["runId"]
+        assert run_id is not None
+
+        # Wait for the background thread to finish and mirror completion to the DB.
+        for _ in range(50):
+            with _registry_lock:
+                entry = _registry.get(run_id)
+            if entry is not None and entry["status"] != "running":
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("background command did not complete in time")
+
+        # Prove the mutation itself (not a test harness shortcut) wrote the
+        # row: read it back straight from the repository.
+        partition_key = f"{itest['endpoint_id']}#{itest['part_id']}"
+        db_row = get_repo("command_run").get(partition_key=partition_key, run_uuid=run_id)
+        assert db_row is not None, "command_run row was not written by runCommand"
+        assert db_row["status"] == "completed"
+        assert "cross-instance output" in (db_row["stdout"] or "")
+
+        # Simulate the poll landing on a different gateway instance: the
+        # process-local dict — and only the process-local dict — is gone.
+        with _registry_lock:
+            _registry.pop(run_id, None)
+
+        poll_data = _gql(
+            """
+            query Poll($run_id: String!) {
+                pollCommand(run_id: $run_id) {
+                    runId
+                    status
+                    stdout
+                    exitCode
+                }
+            }
+            """,
+            itest,
+            {"run_id": run_id},
+        )["pollCommand"]
+
+        assert poll_data["status"] == "completed", \
+            f"expected DB fallback to report completed, got: {poll_data['status']}"
+        assert "cross-instance output" in (poll_data["stdout"] or "")
+        assert poll_data["exitCode"] == "0"
