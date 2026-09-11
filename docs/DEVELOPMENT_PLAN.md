@@ -1241,6 +1241,7 @@ The command executor tests are the highest priority because they protect the dan
 ### Defer
 
 - Python CLI package auto-install (§11) - stub ships in v1; local skill scripts cover the same need until the package registry, install locking, and audit logging are built.
+- DB-backed async command run registry (§18 G-6) - the in-memory registry is correct for a single-process gateway; build the `hsk_command_runs` table only once multi-instance deployment is actually planned.
 - Embedding search.
 - Skill signing.
 - File watcher auto-registration.
@@ -1311,3 +1312,20 @@ This was the LLM's entry point — if `search_skills` can't find the right skill
 `run_command` was fully synchronous: run → capture all output → return. There was no streaming path, so the LLM couldn't see partial progress from long-running scripts.
 
 **Resolved (2026-09-06):** The async `pollCommand` query returns `stdout`/`stderr` incrementally while `status` is `running` — the LLM can poll and see partial output as it arrives. No separate streaming mechanism needed.
+
+### G-6 (Deferred) — Async command registry is process-local; won't survive a multi-instance deployment
+
+`handlers/async_command_executor.py`'s run registry (`_registry`) is an in-process Python dict, and captured stdout/stderr live in local temp files (`tempfile.mkdtemp(prefix="hsk_async_")`) — both documented as intentional for v1 in the module's own docstring. This is correct and sufficient as long as the gateway runs as a single process, which it does today. Two concrete failure modes if that ever changes:
+
+- **Multi-instance behind a load balancer, no sticky routing:** `pollCommand(runId)` landing on an instance that didn't launch that run returns `not_found`, even though the run is genuinely still in progress (or already completed) on the instance that did launch it.
+- **Gateway restart:** the registry and temp files are gone. A run that was still executing (or had just finished) becomes unqueryable — `pollCommand` returns `not_found` regardless of what actually happened to the OS process.
+
+**Plan, when a distributed deployment is actually needed (not before):**
+
+1. **New table `hsk_command_runs`**, same dual-backend pattern already used for `hsk_skills`/`hsk_cli_packages` (PostgreSQL + DynamoDB models, dispatched via `get_repo()`). Columns: `partition_key`, `run_uuid`, `skill_name`, `argv`, `status`, `exit_code`, `stdout`/`stderr` (plain text columns are fine — already bounded by `output_limit_bytes`, no object store needed), `timed_out`, `truncated`, `output_truncated_bytes`, `started_at`/`completed_at`.
+2. **Launch:** `launch_background_command` inserts the row immediately (`status="running"`) in addition to (not instead of) spawning the local subprocess + background thread — the subprocess itself can still only run on the instance that received the `runCommand` mutation; nothing here changes that.
+3. **Progress:** the background thread periodically `UPDATE`s the row (every few seconds, not just once at exit) with partial stdout/stderr, so a poll landing on a different instance sees reasonably fresh output, not only the final result.
+4. **Poll:** `poll_command` becomes a plain DB read instead of a dict lookup — correct from any instance, no GraphQL-layer changes needed. Stale-row cleanup reuses the existing `apscheduler` job pattern already running here (the "Prune old skill versions" job) instead of the current in-memory TTL sweep.
+5. **Explicitly out of scope for this plan:** if the instance that launched a run dies mid-execution, that row is orphaned — a DB-backed registry makes status *visible* everywhere, it does not make the *execution* itself resumable elsewhere. Making a run survive its launching instance dying would mean decoupling launch from execution entirely (a real job queue). There's already a working precedent for that one step in the sibling `mcp_daemon_engine` project: `async_execute_tool_function` dispatches to AWS Lambda (`invocation_type="Event"`) instead of a local thread when running in Lambda mode. Only worth adopting here if this ever actually deploys to Lambda — otherwise it's more infrastructure than the problem warrants.
+
+Build steps 1-4 as one unit if/when multi-instance deployment is planned; leave 5 out unless orphaned-run recovery becomes a real requirement, not just a theoretical one.
