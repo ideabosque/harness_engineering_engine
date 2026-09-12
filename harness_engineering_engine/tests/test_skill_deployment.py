@@ -18,6 +18,7 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from harness_engineering_engine.handlers import skill_version_cache
 from harness_engineering_engine.handlers.skill_deployment import (
     _list_available_files,
     deploy_skill_package,
@@ -121,10 +122,16 @@ class TestDeploySkillPackageActivation:
                 assert kwargs["deployment_status"] == "deployed"
                 assert kwargs["resolved_commit"]
 
-                # Installed directly into the local skill root — no S3 in between.
-                installed = skill_root / "rfq-assistant" / "SKILL.md"
-                assert installed.is_file()
-                assert (skill_root / "rfq-assistant" / ".hsk-skill.json").is_file()
+                # Cached locally for instant promote/rollback and for this
+                # instance's own first skill()/runCommand call — but never
+                # written into the live skill directory by deploy itself;
+                # install is lazy (see skill_reader.py::skill()).
+                assert not (skill_root / "rfq-assistant").exists()
+                version = result["deployed"][0]["version"]
+                cached = skill_version_cache.version_cache_dir(
+                    skill_root, "rfq-assistant", version
+                )
+                assert (cached / "SKILL.md").is_file()
 
     def test_second_version_stays_inactive_until_promoted(self, tmp_path):
         remote = _make_git_skill_repo(tmp_path)
@@ -230,11 +237,20 @@ class TestDeploySkillPackageDiscoveryAndCliPackages:
                 assert result["failed"] == []
                 assert len(result["deployed"]) == 1
                 assert result["deployed"][0]["name"] == "deep-skill"
-                assert (skill_root / "deep-skill" / "SKILL.md").is_file()
 
-    def test_declared_cli_package_is_auto_registered_and_installed(self, tmp_path):
-        """A skill declaring cli_packages gets it registered and installed
-        immediately at deploy time — not deferred to first runCommand."""
+                # Cached locally (lazy install — see skill_reader.py), not
+                # written into the live skill directory by deploy itself.
+                assert not (skill_root / "deep-skill").exists()
+                version = result["deployed"][0]["version"]
+                cached = skill_version_cache.version_cache_dir(
+                    skill_root, "deep-skill", version
+                )
+                assert (cached / "SKILL.md").is_file()
+
+    def test_declared_cli_package_is_registered_but_not_installed(self, tmp_path):
+        """A skill declaring cli_packages gets it registered at deploy
+        time, but installation is lazy — deferred to first runCommand
+        (see cli_package_manager.ensure_package), not done here."""
         cli_yaml = (
             "cli_packages:\n"
             "  - package_name: my-cli-tool\n"
@@ -257,12 +273,6 @@ class TestDeploySkillPackageDiscoveryAndCliPackages:
                 ) as mock_register, patch(
                     "harness_engineering_engine.handlers.cli_package_manager.ensure_package"
                 ) as mock_ensure:
-                    mock_ensure.return_value = {
-                        "package_name": "my-cli-tool",
-                        "version": "1.0.0",
-                        "status": "ready",
-                    }
-
                     result = deploy_skill_package(
                         FakeInfo(), git_repository_url=str(remote), git_ref="main"
                     )
@@ -278,13 +288,13 @@ class TestDeploySkillPackageDiscoveryAndCliPackages:
                     )
                     assert reg_kwargs["version"] == "1.0.0"
 
-                    ensure_args, _ = mock_ensure.call_args
-                    assert ensure_args[1] == "my-cli-tool"
+                    mock_ensure.assert_not_called()
 
-    def test_cli_package_install_failure_fails_that_skill(self, tmp_path):
-        """A CLI package that fails to install fails this skill's deploy —
-        the skill is reported in ``failed``, not registered as deployed
-        with a dependency that doesn't actually work."""
+    def test_broken_cli_package_does_not_block_deploy(self, tmp_path):
+        """A CLI package that would fail to install no longer fails this
+        skill's deploy — installation is deferred to first runCommand, so
+        deploy only ever registers it; a broken dependency surfaces as a
+        runCommand error on first use instead (see cli_package_manager)."""
         cli_yaml = (
             "cli_packages:\n"
             "  - package_name: broken-tool\n"
@@ -304,7 +314,7 @@ class TestDeploySkillPackageDiscoveryAndCliPackages:
 
                 with patch(
                     "harness_engineering_engine.handlers.cli_package_manager.register_cli_package"
-                ), patch(
+                ) as mock_register, patch(
                     "harness_engineering_engine.handlers.cli_package_manager.ensure_package"
                 ) as mock_ensure:
                     mock_ensure.return_value = {
@@ -317,14 +327,23 @@ class TestDeploySkillPackageDiscoveryAndCliPackages:
                         FakeInfo(), git_repository_url=str(remote), git_ref="main"
                     )
 
-                    assert result["deployed"] == []
-                    assert len(result["failed"]) == 1
-                    assert "broken-tool" in result["failed"][0]["error"]
+                    assert result["failed"] == []
+                    assert len(result["deployed"]) == 1
 
-                    # The skill row is never registered when its declared
-                    # CLI dependency isn't actually usable.
-                    fake_repo.insert_update.assert_not_called()
-                    assert not (skill_root / "rfq-assistant").exists()
+                    # Registered, but ensure_package (the actual install) is
+                    # never called at deploy time — its "error" return value
+                    # above is irrelevant here precisely because deploy
+                    # never reaches it.
+                    mock_register.assert_called_once()
+                    mock_ensure.assert_not_called()
+
+                    # Content is still cached locally, ready for this
+                    # instance's own first skill()/runCommand call.
+                    version = result["deployed"][0]["version"]
+                    cached = skill_version_cache.version_cache_dir(
+                        skill_root, "rfq-assistant", version
+                    )
+                    assert (cached / "SKILL.md").is_file()
 
     def test_no_cli_packages_declared_is_unaffected(self, tmp_path):
         """A skill with no cli_packages entries never touches the CLI
@@ -413,7 +432,13 @@ class TestDeploySkillPackageSectionGeneration:
         missing_fields_arg = mock_generate.call_args[0][-1]
         assert missing_fields_arg == {"allowed_commands", "reference_files"}
 
-        sidecar = skill_root / "rfq-assistant" / ".hsk-generated.json"
+        # Written into the version cache — deploy never touches the live
+        # skill directory (see skill_reader.py for the lazy install path).
+        version = result["deployed"][0]["version"]
+        cached = skill_version_cache.version_cache_dir(
+            skill_root, "rfq-assistant", version
+        )
+        sidecar = cached / ".hsk-generated.json"
         assert sidecar.is_file()
         import json as _json
 
@@ -612,7 +637,11 @@ class TestDeploySkillPackageReferenceFilePull:
                 )
 
         assert result["failed"] == []
-        pulled = skill_root / "rfq-assistant" / "config" / "shared.yaml"
+        version = result["deployed"][0]["version"]
+        cached = skill_version_cache.version_cache_dir(
+            skill_root, "rfq-assistant", version
+        )
+        pulled = cached / "config" / "shared.yaml"
         assert pulled.is_file()
         assert pulled.read_text() == "shared: true\n"
 
@@ -643,11 +672,16 @@ class TestDeploySkillPackageReferenceFilePull:
 
         import json as _json
 
-        generated_sidecar = skill_root / "rfq-assistant" / ".hsk-generated.json"
+        version = result["deployed"][0]["version"]
+        cached = skill_version_cache.version_cache_dir(
+            skill_root, "rfq-assistant", version
+        )
+
+        generated_sidecar = cached / ".hsk-generated.json"
         if generated_sidecar.exists():
             assert "pulled_reference_files" not in _json.loads(generated_sidecar.read_text())
 
-        exclusions_sidecar = skill_root / "rfq-assistant" / ".hsk-checksum-exclusions.json"
+        exclusions_sidecar = cached / ".hsk-checksum-exclusions.json"
         exclusions_data = _json.loads(exclusions_sidecar.read_text())
         assert exclusions_data["excluded_relpaths"] == ["config/shared.yaml"]
 
@@ -707,12 +741,16 @@ class TestDeploySkillPackageReferenceFilePull:
         candidate_files_arg = mock_generate.call_args[0][-2]
         assert "config/shared.yaml" in candidate_files_arg
 
-        pulled = skill_root / "rfq-assistant" / "config" / "shared.yaml"
+        version = result["deployed"][0]["version"]
+        cached = skill_version_cache.version_cache_dir(
+            skill_root, "rfq-assistant", version
+        )
+        pulled = cached / "config" / "shared.yaml"
         assert pulled.is_file()
 
         import json as _json
 
-        sidecar = skill_root / "rfq-assistant" / ".hsk-generated.json"
+        sidecar = cached / ".hsk-generated.json"
         data = _json.loads(sidecar.read_text())
         assert data["reference_files"] == ["config/shared.yaml"]
 

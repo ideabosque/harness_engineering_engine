@@ -1,13 +1,20 @@
 # -*- coding: utf-8 -*-
-"""Skill deployment service — git intake, validation, local install, registration.
+"""Skill deployment service — git intake, validation, local caching, registration.
 
 There is no intermediate artifact store: a skill is cloned straight from its
 git remote, validated, checksummed, and cached locally
-(``skill_version_cache``) so ``promoteSkillVersion``/``rollbackSkill`` can
-swap versions instantly; the active version is additionally installed into
-``HSK_SKILL_ROOT``. The registration row records the resolved commit SHA so
-*other* hosts (that never cached this version locally) can refresh straight
-from the same git remote (see ``skill_refresh.py``).
+(``skill_version_cache.store_version``) so ``promoteSkillVersion``/
+``rollbackSkill`` can swap versions instantly. Deploy deliberately does
+*not* also install into the live ``HSK_SKILL_ROOT/<name>`` directory —
+that's lazy: the first ``skill()``/``runCommand`` call against this version
+(on *any* instance, including this one) installs it, synchronously from
+this local cache when present (no network), or by cloning from git when not
+(see ``skill_reader.py``/``skill_refresh.py``). This keeps every instance's
+install path uniform in a multi-instance deployment instead of only ever
+pre-warming whichever instance happened to receive the deploy call. The
+registration row records the resolved commit SHA so *other* hosts (that
+never cached this version locally) can refresh straight from the same git
+remote.
 """
 from __future__ import print_function
 
@@ -146,20 +153,23 @@ def _list_repo_wide_files(content_root: Path, skill_dir_set: Set[Path]) -> List[
 def _ensure_cli_packages(
     info: Any, cli_packages: List[Dict[str, Any]], updated_by: str
 ) -> None:
-    """Auto-register and install every CLI package a skill declares.
+    """Auto-register every CLI package a skill declares.
 
     A ``cli_packages`` entry that carries ``git_repository_url`` and
     ``version`` is registered (upserted) here; one that doesn't is assumed
     to already be registered separately via ``insertUpdateCliPackage``.
-    Either way, installation is verified immediately (not deferred to first
-    ``runCommand``) — raises on the first failure so the caller's per-skill
-    try/except reports this skill as failed rather than deploying a skill
-    whose declared dependency isn't actually usable yet.
+    Registration is pure DB bookkeeping — no pip install happens here.
+    Installation is lazy: ``ensure_package`` runs on first ``runCommand``
+    against this skill (see ``command_executor.py`` /
+    ``mutations/skill_management.py::RunCommand``), which also detects and
+    reinstalls on git-commit drift, not just a changed ``version`` string.
+    A broken/uninstallable dependency therefore no longer fails the deploy —
+    it surfaces as a ``runCommand`` error on first use instead.
     """
     if not cli_packages:
         return
 
-    from .cli_package_manager import ensure_package, register_cli_package
+    from .cli_package_manager import register_cli_package
 
     for pkg in cli_packages:
         package_name = pkg.get("package_name") or pkg.get("distribution_name")
@@ -177,13 +187,6 @@ def _ensure_cli_packages(
                 git_ref=pkg.get("git_ref"),
                 description=pkg.get("description"),
                 updated_by=updated_by,
-            )
-
-        result = ensure_package(info, package_name)
-        if result.get("status") != "ready":
-            raise RuntimeError(
-                f"CLI package '{package_name}' is not ready: "
-                f"{result.get('error', 'unknown error')}"
             )
 
 
@@ -208,8 +211,10 @@ def deploy_skill_package(
     2. Otherwise, clone the remote at ``git_ref`` and validate each skill
        found.
     3. Compute a content checksum for each skill.
-    4. Install directly into ``HSK_SKILL_ROOT`` on this host when the
-       version becomes active.
+    4. Cache the content locally (``skill_version_cache.store_version``) —
+       never installed into the live ``HSK_SKILL_ROOT`` here; that happens
+       lazily on the first ``skill()``/``runCommand`` call, on whichever
+       instance receives it.
     5. Register each skill version in the database.
     """
     logger = info.context.get("logger") or logging.getLogger(__name__)
@@ -273,11 +278,11 @@ def deploy_skill_package(
                     "%Y.%m.%d.1"
                 )
 
-                # Auto-register and install any CLI packages this skill
-                # declares, before the skill itself is registered as
-                # deployed — a broken/uninstallable dependency should fail
-                # this skill's deploy, not leave it registered as active
-                # with a dependency that doesn't actually work yet.
+                # Auto-register any CLI packages this skill declares — pure
+                # DB bookkeeping, no install. Install is lazy (see
+                # cli_package_manager.ensure_package), so a broken/
+                # uninstallable dependency surfaces at first runCommand,
+                # not here.
                 _ensure_cli_packages(
                     info, validation["cli_packages"], updated_by="system"
                 )
@@ -382,11 +387,12 @@ def deploy_skill_package(
                     updated_by="system",
                 )
 
-                # Cache this version's content locally so promote/rollback
-                # can swap to it instantly with no remote fetch. Only the
-                # active version is additionally installed into the live
-                # skill directory — an inactive version stays cached-only
-                # until promoted.
+                # Cache this version's content locally so promote/rollback,
+                # and this same instance's own first skill()/runCommand
+                # call, can install it instantly with no remote fetch —
+                # active or not, deploy itself never writes into the live
+                # skill directory. See the module docstring: install is
+                # lazy on every instance uniformly.
                 skill_version_cache.store_version(
                     skill_root, resolved_name, resolved_version, skill_git_repository_url_dir
                 )
@@ -405,20 +411,6 @@ def deploy_skill_package(
                     resolved_commit,
                     sorted(pulled_excluded),
                 )
-                if activate:
-                    skill_version_cache.install_from_cache(
-                        skill_root, resolved_name, resolved_version
-                    )
-                    skill_version_cache.write_local_metadata(
-                        skill_root / resolved_name,
-                        name=resolved_name,
-                        version=resolved_version,
-                         
-                        git_repository_url=git_repository_url,
-                        git_ref=git_ref,
-                        resolved_commit=resolved_commit,
-                        content_checksum=content_checksum,
-                    )
 
                 logger.info(
                     f"Deployed skill '{resolved_name}' v{resolved_version} "

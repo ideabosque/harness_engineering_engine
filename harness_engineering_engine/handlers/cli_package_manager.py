@@ -1,15 +1,30 @@
 # -*- coding: utf-8 -*-
 """Harness Engineering Engine CLI package manager.
 
-Handles registration, GitHub-based installation, version verification, and
-package-level deployment locks for approved Python CLI packages.
+Handles registration and lazy, GitHub-based installation/reinstallation of
+approved Python CLI packages. Registration (DB bookkeeping) and installation
+(pip + local marker) are deliberately separate: ``deploySkillPackage`` only
+ever registers a declared ``cli_packages`` entry; ``ensure_package`` is what
+actually installs, and it runs lazily on first ``runCommand`` against a
+skill that declares the package (see ``command_executor.py`` and
+``mutations/skill_management.py::RunCommand``).
 
-Flow (per DEVELOPMENT_PLAN.md §11):
-1. Load registered package metadata from the database.
-2. Compare locally installed version with the registered version.
-3. Missing → install from GitHub ref → verify → continue.
-4. Outdated → lock → uninstall → reinstall → verify → continue.
-5. Matching → no action.
+Flow:
+1. Load registered package metadata (name/git_repository_url/version/
+   git_ref) from the database.
+2. Compare the locally installed pip distribution version against the
+   registered ``version`` string.
+3. Also resolve the registered ``git_ref`` to its current commit SHA (a
+   cheap ``git ls-remote``, no clone) and compare against the commit this
+   host last installed from (recorded in a local marker file, since which
+   commit is actually installed is host-local state, not something a
+   shared DB row can represent safely in a multi-instance deployment) — a
+   floating ref like ``main`` can gain new commits without the skill
+   author ever bumping the declared ``version`` string, which a
+   version-string-only comparison would silently miss.
+4. Both match → no action (the common, fast case).
+5. Either differs → lock → install (or uninstall+reinstall) → verify →
+   record the new commit in the local marker → continue.
 6. Installation/verification failures are logged and block execution.
 
 All pip operations use ``subprocess.run([sys.executable, "-m", "pip", ...])``
@@ -20,16 +35,20 @@ from __future__ import print_function
 __author__ = "bibow"
 
 import importlib.metadata
+import json
 import logging
 import subprocess
 import sys
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from ..handlers.config import Config
 from ..models.repositories import get_repo
+from . import git_client
+from .skill_path import resolve_skill_root
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +85,67 @@ def _get_installed_version(distribution_name: str) -> Optional[str]:
         return None
     except Exception:
         return None
+
+
+def _resolve_current_commit(git_url: str, git_ref: str) -> Optional[str]:
+    """Resolve ``git_ref`` to its current commit SHA, or ``None`` on failure.
+
+    A cheap ``git ls-remote`` — no clone. Returning ``None`` (rather than
+    raising) means a transient network hiccup falls back to the
+    version-string-only check instead of forcing a spurious reinstall.
+    """
+    if not git_url:
+        return None
+    try:
+        return git_client.resolve_ref_sha(git_url, git_ref or "main")
+    except Exception:
+        return None
+
+
+def _install_marker_path(package_name: str) -> Path:
+    """Path to the host-local record of what this host last installed.
+
+    Deliberately host-local (like a skill's own ``.hsk-skill.json``), not a
+    DB field on the ``CliPackage`` registration row: the row is shared
+    tenant state, but "is this commit actually installed in THIS host's
+    Python environment" can only ever be true for one host at a time in a
+    multi-instance deployment.
+    """
+    return resolve_skill_root() / ".hsk-cli-packages" / f"{package_name}.json"
+
+
+def _read_install_marker(package_name: str) -> Optional[Dict[str, Any]]:
+    path = _install_marker_path(package_name)
+    if not path.is_file():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_install_marker(
+    package_name: str,
+    distribution_name: str,
+    version: str,
+    resolved_commit: Optional[str],
+    git_repository_url: str,
+    git_ref: str,
+) -> None:
+    path = _install_marker_path(package_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "package_name": package_name,
+        "distribution_name": distribution_name,
+        "version": version,
+        "resolved_commit": resolved_commit,
+        "git_repository_url": git_repository_url,
+        "git_ref": git_ref,
+        "installed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -312,12 +392,35 @@ def ensure_package(info: Any, package_name: str) -> Dict[str, Any]:
     # as the distribution name by default.
     distribution_name = registration.get("distribution_name") or package_name
 
-    # 2. Compare installed version with registered version
+    # 2. Compare installed version with registered version, and — since a
+    # floating git_ref can gain new commits without the declared version
+    # string ever changing — also compare the commit this host last
+    # installed from against the ref's current commit.
     installed_version = _get_installed_version(distribution_name)
+    install_marker = _read_install_marker(package_name)
+    current_commit = _resolve_current_commit(git_url, git_ref)
 
-    if installed_version == target_version:
+    def _commit_confirmed_current() -> bool:
+        # No commit to compare against (offline, or a non-git registration)
+        # → don't force a reinstall on a version string that already
+        # matches; that would turn a transient network hiccup into
+        # needless churn. A version match with no prior marker at all is
+        # treated as already-current too (e.g. installed before this
+        # commit-tracking existed) — the marker below then gets backfilled
+        # so the *next* check has something real to compare against.
+        if current_commit is None or install_marker is None:
+            return True
+        return install_marker.get("resolved_commit") == current_commit
+
+    if installed_version == target_version and _commit_confirmed_current():
+        if current_commit is not None and install_marker is None:
+            _write_install_marker(
+                package_name, distribution_name, target_version,
+                current_commit, git_url, git_ref,
+            )
         logger.info(
-            f"CLI package '{package_name}' v{target_version} already installed."
+            f"CLI package '{package_name}' v{target_version} already installed "
+            f"(commit {current_commit or 'unresolved'})."
         )
         _audit_log(
             logger, partition_key, package_name,
@@ -339,10 +442,11 @@ def ensure_package(info: Any, package_name: str) -> Dict[str, Any]:
         return {"package_name": package_name, "status": "error", "error": msg}
 
     try:
-        # 4. Re-check installed version after acquiring the lock
+        # 4. Re-check installed version (and commit) after acquiring the lock
         installed_version = _get_installed_version(distribution_name)
+        install_marker = _read_install_marker(package_name)
 
-        if installed_version == target_version:
+        if installed_version == target_version and _commit_confirmed_current():
             # Another worker installed it while we waited
             logger.info(
                 f"CLI package '{package_name}' v{target_version} became current while waiting."
@@ -436,8 +540,13 @@ def ensure_package(info: Any, package_name: str) -> Dict[str, Any]:
             )
             return {"package_name": package_name, "status": "error", "error": error}
 
+        _write_install_marker(
+            package_name, distribution_name, target_version,
+            current_commit, git_url, git_ref,
+        )
         logger.info(
-            f"CLI package '{package_name}' v{target_version} installed and verified."
+            f"CLI package '{package_name}' v{target_version} installed and verified "
+            f"(commit {current_commit or 'unresolved'})."
         )
         _audit_log(
             logger, partition_key, package_name,

@@ -236,6 +236,14 @@ class TestDataReconciliation:
             deployed = json.loads(deployed)
         deployed = deployed[0]
 
+        # Deploy only caches the content locally (§18 G-7) — install into
+        # the live directory (and .hsk-skill.json) is lazy, on first
+        # skill() read. Trigger that here before checking local metadata.
+        _gql(
+            'query { skill(name: "reconcile-check") { name } }',
+            itest,
+        )
+
         meta_file = tmp / "reconcile-check" / ".hsk-skill.json"
         local_metadata = json.loads(meta_file.read_text())
 

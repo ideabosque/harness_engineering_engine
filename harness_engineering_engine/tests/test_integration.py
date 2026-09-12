@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 
+from harness_engineering_engine.handlers import skill_version_cache
 from harness_engineering_engine.handlers.config import Config
 from harness_engineering_engine.schema import Mutations, Query, type_class
 
@@ -181,8 +182,14 @@ class TestDeploySkillPackage:
         assert deployed["isActive"] is True
         assert len(deployed["resolvedCommit"]) == 40
 
-        # Installed directly into the local skill root — no artifact store.
-        installed = itest["tmp"] / "git-skill" / "SKILL.md"
+        # Cached locally — no artifact store — but not written into the
+        # live skill directory by deploy itself; that install is lazy, on
+        # this instance's own first skill()/runCommand call (§18 G-7).
+        assert not (itest["tmp"] / "git-skill").exists()
+        cached = skill_version_cache.version_cache_dir(
+            itest["tmp"], "git-skill", deployed["version"]
+        )
+        installed = cached / "SKILL.md"
         assert installed.is_file()
         assert "Git body v1." in installed.read_text()
 

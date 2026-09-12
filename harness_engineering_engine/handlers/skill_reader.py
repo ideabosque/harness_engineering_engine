@@ -190,69 +190,100 @@ def skill(
             local_metadata = None
 
     if not _local_metadata_matches(local_metadata, active):
-        # Check if a background refresh is already in progress
-        from .skill_refresh_tracker import is_refreshing, launch_refresh
-
-        if is_refreshing(partition_key, name):
-            logger.info(
-                f"Refresh already in progress for skill '{name}' — "
-                f"returning {'stale' if skill_dir.is_dir() else 'refreshing'} signal."
+        # Lazy install, fast path: this exact version may already be sitting
+        # in the local per-version cache — because this same instance is
+        # the one that deployed it, redeployed it, or promoted it earlier.
+        # skill_deployment.py deliberately never writes into the live skill
+        # directory itself (see its module docstring); this is where that
+        # deferred install actually happens. A plain local copy needs no
+        # network, so do it synchronously instead of the background-thread
+        # git-refresh treatment below — the common case (this instance
+        # already has it cached) should never have to return a transient
+        # "refreshing" placeholder.
+        installed_from_cache = skill_version_cache.install_from_cache(
+            skill_root, name, active["version"]
+        )
+        if installed_from_cache:
+            skill_version_cache.write_local_metadata(
+                skill_dir,
+                name=active["name"],
+                version=active["version"],
+                git_repository_url=active.get("git_repository_url"),
+                git_ref=active.get("git_ref"),
+                resolved_commit=active.get("resolved_commit"),
+                content_checksum=active.get("content_checksum"),
             )
-            if not (skill_dir / "SKILL.md").is_file():
-                # No local content at all — tell the caller to retry
-                return {
-                    "name": active["name"],
-                    "version": active["version"],
-                    "description": active["description"],
-                    "body": "",
-                    "status": "refreshing",
-                    "allowed_commands": [],
-                    "cli_packages": [],
-                    "references": [],
-                    "local_path": str(skill_dir),
-                    "stale_index": True,
-                    "deployment_status": active.get("deployment_status"),
-                    "updated_at": active.get("updated_at"),
-                }
-            # Fall through: SKILL.md exists locally (stale), return it
-            # while the refresh completes in the background.
             logger.info(
-                f"Returning stale content for skill '{name}' while refresh completes."
+                f"Installed skill '{name}' v{active['version']} from local "
+                f"version cache (lazy install, no clone needed)."
             )
+            # Fall through — SKILL.md is now installed; read it below as normal.
         else:
-            # Launch the refresh in background
-            logger.info(
-                f"Local metadata stale or missing for skill '{name}' — "
-                f"launching background refresh from git."
-            )
-            launch_refresh(
-                logger=logger,
-                partition_key=partition_key,
-                skill_name=name,
-                active=active,
-                skill_root=str(skill_root),
-            )
+            # This instance has never cached this version locally —
+            # genuinely needs a git fetch. Check if a background refresh is
+            # already in progress.
+            from .skill_refresh_tracker import is_refreshing, launch_refresh
 
-            # If SKILL.md doesn't exist yet (first-time load), return refreshing
-            if not (skill_dir / "SKILL.md").is_file():
-                return {
-                    "name": active["name"],
-                    "version": active["version"],
-                    "description": active["description"],
-                    "body": "",
-                    "status": "refreshing",
-                    "allowed_commands": [],
-                    "cli_packages": [],
-                    "references": [],
-                    "local_path": str(skill_dir),
-                    "stale_index": True,
-                    "deployment_status": active.get("deployment_status"),
-                    "updated_at": active.get("updated_at"),
-                }
-            # Fall through: return stale content while refresh runs
-            logger.info(
-                f"Returning stale content for skill '{name}' while background refresh completes."
-            )
+            if is_refreshing(partition_key, name):
+                logger.info(
+                    f"Refresh already in progress for skill '{name}' — "
+                    f"returning {'stale' if skill_dir.is_dir() else 'refreshing'} signal."
+                )
+                if not (skill_dir / "SKILL.md").is_file():
+                    # No local content at all — tell the caller to retry
+                    return {
+                        "name": active["name"],
+                        "version": active["version"],
+                        "description": active["description"],
+                        "body": "",
+                        "status": "refreshing",
+                        "allowed_commands": [],
+                        "cli_packages": [],
+                        "references": [],
+                        "local_path": str(skill_dir),
+                        "stale_index": True,
+                        "deployment_status": active.get("deployment_status"),
+                        "updated_at": active.get("updated_at"),
+                    }
+                # Fall through: SKILL.md exists locally (stale), return it
+                # while the refresh completes in the background.
+                logger.info(
+                    f"Returning stale content for skill '{name}' while refresh completes."
+                )
+            else:
+                # Launch the refresh in background
+                logger.info(
+                    f"Local metadata stale or missing for skill '{name}' — "
+                    f"launching background refresh from git."
+                )
+                launch_refresh(
+                    logger=logger,
+                    partition_key=partition_key,
+                    skill_name=name,
+                    active=active,
+                    skill_root=str(skill_root),
+                )
+
+                # If SKILL.md doesn't exist yet (first-time load), return refreshing
+                if not (skill_dir / "SKILL.md").is_file():
+                    return {
+                        "name": active["name"],
+                        "version": active["version"],
+                        "description": active["description"],
+                        "body": "",
+                        "status": "refreshing",
+                        "allowed_commands": [],
+                        "cli_packages": [],
+                        "references": [],
+                        "local_path": str(skill_dir),
+                        "stale_index": True,
+                        "deployment_status": active.get("deployment_status"),
+                        "updated_at": active.get("updated_at"),
+                    }
+                # Fall through: return stale content while refresh runs
+                logger.info(
+                    f"Returning stale content for skill '{name}' while background refresh completes."
+                )
 
     # ------------------------------------------------------------------
     # Validate SKILL.md and compute local checksum
