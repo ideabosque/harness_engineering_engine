@@ -33,14 +33,28 @@ def _ignore_hidden(_dir: str, names: List[str]) -> List[str]:
 def _resolve_skill_content_dir(clone_dir: Path, skill_name: str) -> Path:
     """Locate the skill's content within a cloned repo.
 
-    Multi-skill repos nest each skill under a folder named after it; a
-    single-skill repo has ``SKILL.md`` at the root.
+    Mirrors ``deploy_skill_package``'s own discovery exactly: a recursive
+    search for ``SKILL.md`` (``clone_dir.rglob`` already includes the repo
+    root itself, covering the single-skill-at-root case too), matched by
+    declared frontmatter ``name`` rather than assumed folder layout. A
+    multi-skill repo may nest ``SKILL.md`` any number of directories deep
+    (e.g. ``.claude/skills/<name>/SKILL.md``), not just directly under a
+    folder named after the skill — a real repo hit exactly this shape and
+    would deploy successfully but never refresh on any host that didn't
+    already have it locally cached (found via end-to-end testing against
+    ``ingredient_optimization_agent``, 2026-09-12).
     """
-    candidate = clone_dir / skill_name
-    if candidate.is_dir() and (candidate / "SKILL.md").is_file():
-        return candidate
-    if (clone_dir / "SKILL.md").is_file():
-        return clone_dir
+    for skill_md in sorted(
+        p
+        for p in clone_dir.rglob("SKILL.md")
+        if ".git" not in p.relative_to(clone_dir).parts
+    ):
+        try:
+            parsed = parse_skill_file(skill_md)
+        except Exception:
+            continue
+        if parsed.frontmatter.name == skill_name:
+            return skill_md.parent
     raise ValueError(f"Fetched source for '{skill_name}' does not contain SKILL.md")
 
 
